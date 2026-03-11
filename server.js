@@ -1,535 +1,434 @@
 /**
- * Molecord - Real-time chat with voice, video & screenshare
- * WebRTC signaling server + REST API + SQLite persistence
+ * Molecord v2
  */
+const express=require('express');const http=require('http');const WebSocket=require('ws');
+const Database=require('better-sqlite3');const bcrypt=require('bcryptjs');
+const cookieParser=require('cookie-parser');const{v4:uuidv4}=require('uuid');
+const path=require('path');const fs=require('fs');const multer=require('multer');
 
-const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-const Database = require('better-sqlite3');
-const bcrypt = require('bcryptjs');
-const cookieParser = require('cookie-parser');
-const { v4: uuidv4 } = require('uuid');
-const path = require('path');
+const app=express();const server=http.createServer(app);const wss=new WebSocket.Server({server});
+const UPLOAD_DIR=path.join(__dirname,'public','uploads');
+if(!fs.existsSync(UPLOAD_DIR))fs.mkdirSync(UPLOAD_DIR,{recursive:true});
+const storage=multer.diskStorage({destination:(req,file,cb)=>cb(null,UPLOAD_DIR),filename:(req,file,cb)=>{const ext=path.extname(file.originalname).toLowerCase()||'.jpg';cb(null,uuidv4()+ext);}});
+const upload=multer({storage,limits:{fileSize:8*1024*1024},fileFilter:(req,file,cb)=>cb(null,/image\/|video\/|audio\//.test(file.mimetype))});
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-// ─── Database ─────────────────────────────────────────────────────────────────
-const db = new Database('./molecord.db');
+const db=new Database(path.join(__dirname,'molecord.db'));
+db.pragma('journal_mode = WAL');
 db.exec(`
-  PRAGMA journal_mode=WAL;
-
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
-    display_name TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    avatar TEXT DEFAULT '🧑',
-    status TEXT DEFAULT 'online',
-    custom_status TEXT DEFAULT '',
-    created_at INTEGER DEFAULT (unixepoch())
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS servers (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    icon TEXT DEFAULT '🌐',
-    owner_id TEXT NOT NULL,
-    created_at INTEGER DEFAULT (unixepoch())
-  );
-
-  CREATE TABLE IF NOT EXISTS server_members (
-    server_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    role TEXT DEFAULT 'member',
-    joined_at INTEGER DEFAULT (unixepoch()),
-    PRIMARY KEY(server_id, user_id)
-  );
-
-  CREATE TABLE IF NOT EXISTS channels (
-    id TEXT PRIMARY KEY,
-    server_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    type TEXT DEFAULT 'text',
-    topic TEXT DEFAULT '',
-    position INTEGER DEFAULT 0,
-    created_at INTEGER DEFAULT (unixepoch())
-  );
-
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    channel_id TEXT NOT NULL,
-    author_id TEXT NOT NULL,
-    content TEXT NOT NULL,
-    pinned INTEGER DEFAULT 0,
-    edited INTEGER DEFAULT 0,
-    reply_to TEXT,
-    created_at INTEGER DEFAULT (unixepoch() * 1000)
-  );
-
-  CREATE TABLE IF NOT EXISTS reactions (
-    message_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    emoji TEXT NOT NULL,
-    PRIMARY KEY(message_id, user_id, emoji)
-  );
-
-  CREATE TABLE IF NOT EXISTS friendships (
-    user_a TEXT NOT NULL,
-    user_b TEXT NOT NULL,
-    status TEXT DEFAULT 'accepted',
-    PRIMARY KEY(user_a, user_b)
-  );
-
-  CREATE TABLE IF NOT EXISTS direct_messages (
-    id TEXT PRIMARY KEY,
-    from_user TEXT NOT NULL,
-    to_user TEXT NOT NULL,
-    content TEXT NOT NULL,
-    edited INTEGER DEFAULT 0,
-    created_at INTEGER DEFAULT (unixepoch() * 1000)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at);
-  CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,email TEXT UNIQUE,display_name TEXT NOT NULL,password_hash TEXT NOT NULL,avatar TEXT,avatar_emoji TEXT DEFAULT '🧑',banner TEXT,status TEXT DEFAULT 'online',custom_status TEXT DEFAULT '',bio TEXT DEFAULT '',created_at INTEGER DEFAULT(unixepoch()));
+CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS servers(id TEXT PRIMARY KEY,name TEXT NOT NULL,icon TEXT,icon_emoji TEXT DEFAULT '🌐',banner TEXT,description TEXT DEFAULT '',owner_id TEXT NOT NULL,is_public INTEGER DEFAULT 1,created_at INTEGER DEFAULT(unixepoch()));
+CREATE TABLE IF NOT EXISTS server_members(server_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT DEFAULT 'member',nickname TEXT,joined_at INTEGER DEFAULT(unixepoch()),PRIMARY KEY(server_id,user_id));
+CREATE TABLE IF NOT EXISTS channels(id TEXT PRIMARY KEY,server_id TEXT NOT NULL,name TEXT NOT NULL,type TEXT DEFAULT 'text',topic TEXT DEFAULT '',position INTEGER DEFAULT 0,created_at INTEGER DEFAULT(unixepoch()));
+CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,channel_id TEXT NOT NULL,author_id TEXT NOT NULL,content TEXT NOT NULL,attachment_url TEXT,attachment_type TEXT,pinned INTEGER DEFAULT 0,edited INTEGER DEFAULT 0,reply_to TEXT,created_at INTEGER DEFAULT(unixepoch()*1000));
+CREATE TABLE IF NOT EXISTS reactions(message_id TEXT NOT NULL,user_id TEXT NOT NULL,emoji TEXT NOT NULL,PRIMARY KEY(message_id,user_id,emoji));
+CREATE TABLE IF NOT EXISTS friendships(id TEXT PRIMARY KEY,requester_id TEXT NOT NULL,addressee_id TEXT NOT NULL,status TEXT DEFAULT 'pending',created_at INTEGER DEFAULT(unixepoch()));
+CREATE TABLE IF NOT EXISTS direct_messages(id TEXT PRIMARY KEY,from_user TEXT NOT NULL,to_user TEXT NOT NULL,content TEXT NOT NULL,attachment_url TEXT,attachment_type TEXT,edited INTEGER DEFAULT 0,created_at INTEGER DEFAULT(unixepoch()*1000));
+CREATE TABLE IF NOT EXISTS user_settings(user_id TEXT PRIMARY KEY,theme_bg TEXT,theme_bg_blur INTEGER DEFAULT 0,theme_bg_dim INTEGER DEFAULT 40,notifications INTEGER DEFAULT 1);
+CREATE INDEX IF NOT EXISTS idx_msg_ch ON messages(channel_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_dm ON direct_messages(from_user,to_user,created_at);
 `);
 
-// Seed default server
-if (!db.prepare('SELECT id FROM servers LIMIT 1').get()) {
-  const sysId = 'system';
-  db.prepare(`INSERT OR IGNORE INTO users (id,username,display_name,password_hash,avatar) VALUES (?,?,?,?,?)`)
-    .run(sysId, 'molecord_bot', 'Molecord Bot', '$invalid', '🤖');
-  const sid = uuidv4();
-  db.prepare(`INSERT INTO servers (id,name,icon,owner_id) VALUES (?,?,?,?)`).run(sid, 'Molecord HQ', '🔵', sysId);
-  const cids = [uuidv4(), uuidv4(), uuidv4(), uuidv4()];
-  db.prepare(`INSERT INTO channels (id,server_id,name,type,topic,position) VALUES (?,?,?,?,?,?)`).run(cids[0], sid, 'general', 'text', 'General chat for everyone', 0);
-  db.prepare(`INSERT INTO channels (id,server_id,name,type,topic,position) VALUES (?,?,?,?,?,?)`).run(cids[1], sid, 'introductions', 'text', 'Say hello!', 1);
-  db.prepare(`INSERT INTO channels (id,server_id,name,type,topic,position) VALUES (?,?,?,?,?,?)`).run(cids[2], sid, 'General', 'voice', '', 2);
-  db.prepare(`INSERT INTO channels (id,server_id,name,type,topic,position) VALUES (?,?,?,?,?,?)`).run(cids[3], sid, 'Gaming', 'voice', '', 3);
-  db.prepare(`INSERT INTO messages (id,channel_id,author_id,content) VALUES (?,?,?,?)`)
-    .run(uuidv4(), cids[0], sysId, '👋 Welcome to **Molecord**! Create an account and start chatting. Voice channels support real audio and screenshare!');
+function seedIfEmpty(){
+  const cnt=db.prepare('SELECT COUNT(*) as c FROM servers').get();
+  if(cnt.c>0)return;
+  const bid='system-bot';
+  db.prepare('INSERT OR IGNORE INTO users(id,username,display_name,password_hash,avatar_emoji)VALUES(?,?,?,?,?)').run(bid,'molecord_bot','Molecord Bot','$none','🤖');
+  const sid=uuidv4();
+  db.prepare('INSERT INTO servers(id,name,icon_emoji,description,owner_id,is_public)VALUES(?,?,?,?,?,?)').run(sid,'Molecord HQ','🔵','The official Molecord hangout!',bid,1);
+  const cids=[uuidv4(),uuidv4(),uuidv4(),uuidv4(),uuidv4()];
+  db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position)VALUES(?,?,?,?,?,?)').run(cids[0],sid,'welcome','text','👋 Introduce yourself!',0);
+  db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position)VALUES(?,?,?,?,?,?)').run(cids[1],sid,'general','text','General chat',1);
+  db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position)VALUES(?,?,?,?,?,?)').run(cids[2],sid,'off-topic','text','Anything goes',2);
+  db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position)VALUES(?,?,?,?,?,?)').run(cids[3],sid,'General Voice','voice','',3);
+  db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position)VALUES(?,?,?,?,?,?)').run(cids[4],sid,'Gaming','voice','',4);
+  db.prepare('INSERT INTO messages(id,channel_id,author_id,content)VALUES(?,?,?,?)').run(uuidv4(),cids[0],bid,'👋 Welcome to Molecord! Create an account and start chatting. Voice channels support real audio, video, and screenshare!');
+}
+seedIfEmpty();
+
+app.use(express.json({limit:'10mb'}));app.use(cookieParser());
+app.use('/uploads',express.static(UPLOAD_DIR));
+app.use(express.static(path.join(__dirname,'public')));
+
+function auth(req,res,next){
+  const sid=req.cookies?.mc_sess;if(!sid)return res.status(401).json({error:'Not authenticated'});
+  const sess=db.prepare('SELECT s.user_id,u.* FROM sessions s JOIN users u ON s.user_id=u.id WHERE s.id=? AND s.expires_at>unixepoch()').get(sid);
+  if(!sess)return res.status(401).json({error:'Session expired'});
+  req.user=sess;next();
+}
+function su(u){return{id:u.id,username:u.username,email:u.email,displayName:u.display_name,avatar:u.avatar,avatarEmoji:u.avatar_emoji,banner:u.banner,status:u.status,customStatus:u.custom_status,bio:u.bio};}
+function ss(s,uid){
+  const channels=db.prepare('SELECT * FROM channels WHERE server_id=? ORDER BY position').all(s.id);
+  const members=db.prepare("SELECT u.*,sm.role,sm.nickname FROM server_members sm JOIN users u ON sm.user_id=u.id WHERE sm.server_id=? AND u.id!='system-bot'").all(s.id);
+  const myRole=uid?db.prepare('SELECT role FROM server_members WHERE server_id=? AND user_id=?').get(s.id,uid)?.role:null;
+  return{id:s.id,name:s.name,icon:s.icon,iconEmoji:s.icon_emoji,banner:s.banner,description:s.description,ownerId:s.owner_id,isPublic:!!s.is_public,memberCount:members.length,myRole,channels:channels.map(c=>({id:c.id,name:c.name,type:c.type,topic:c.topic,position:c.position})),members:members.map(m=>({...su(m),role:m.role,nickname:m.nickname}))};
+}
+function sm(m){
+  const u=db.prepare('SELECT * FROM users WHERE id=?').get(m.author_id);
+  const rxns=db.prepare('SELECT emoji,user_id FROM reactions WHERE message_id=?').all(m.id);
+  const g={};rxns.forEach(r=>{if(!g[r.emoji])g[r.emoji]=[];g[r.emoji].push(r.user_id);});
+  return{id:m.id,channelId:m.channel_id,authorId:m.author_id,authorName:u?.display_name||'?',authorAvatar:u?.avatar,authorAvatarEmoji:u?.avatar_emoji||'👤',content:m.content,attachmentUrl:m.attachment_url,attachmentType:m.attachment_type,pinned:!!m.pinned,edited:!!m.edited,replyTo:m.reply_to,timestamp:m.created_at,reactions:g};
 }
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(express.json());
-app.use(cookieParser());
-app.use(express.static(path.join(__dirname, 'public')));
-
-function requireAuth(req, res, next) {
-  const sid = req.cookies?.mc_session;
-  if (!sid) return res.status(401).json({ error: 'Not authenticated' });
-  const session = db.prepare(`
-    SELECT s.*, u.id as uid, u.username, u.display_name, u.avatar, u.status, u.custom_status
-    FROM sessions s JOIN users u ON s.user_id = u.id
-    WHERE s.id = ? AND s.expires_at > unixepoch()
-  `).get(sid);
-  if (!session) return res.status(401).json({ error: 'Session expired' });
-  req.user = session;
-  next();
-}
-
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-app.post('/api/auth/register', (req, res) => {
-  const { username, password, displayName } = req.body;
-  if (!username || !password || username.length < 2 || password.length < 6)
-    return res.status(400).json({ error: 'Username ≥2 chars, password ≥6 chars' });
-  const clean = username.toLowerCase().replace(/[^a-z0-9_]/g, '');
-  if (!clean) return res.status(400).json({ error: 'Invalid username' });
-  if (db.prepare('SELECT id FROM users WHERE username=?').get(clean))
-    return res.status(409).json({ error: 'Username taken' });
-  const id = uuidv4();
-  const avatars = ['🧑','👩','👨','🧔','👱','🧑‍💻','👩‍💻','🧑‍🎤','🧑‍🚀','👾'];
-  db.prepare(`INSERT INTO users (id,username,display_name,password_hash,avatar) VALUES (?,?,?,?,?)`)
-    .run(id, clean, displayName || username, bcrypt.hashSync(password, 10), avatars[Math.floor(Math.random()*avatars.length)]);
-  // Auto-join default server
-  const defSrv = db.prepare('SELECT id FROM servers ORDER BY created_at LIMIT 1').get();
-  if (defSrv) db.prepare('INSERT OR IGNORE INTO server_members (server_id,user_id) VALUES (?,?)').run(defSrv.id, id);
-  const sessionId = uuidv4();
-  const expires = Math.floor(Date.now()/1000) + 86400*30;
-  db.prepare('INSERT INTO sessions (id,user_id,expires_at) VALUES (?,?,?)').run(sessionId, id, expires);
-  res.cookie('mc_session', sessionId, { httpOnly: true, maxAge: 86400*30*1000, sameSite: 'lax' });
-  const user = { id, username: clean, displayName: displayName||username, avatar: avatars[0], status: 'online' };
-  broadcast(null, { type: 'USER_JOIN', user });
-  res.json(user);
+// AUTH
+app.post('/api/auth/register',(req,res)=>{
+  try{
+    const{username,email,password,displayName}=req.body;
+    if(!username||!password)return res.status(400).json({error:'Username and password required'});
+    if(password.length<6)return res.status(400).json({error:'Password must be at least 6 characters'});
+    const clean=username.toLowerCase().replace(/[^a-z0-9_.]/g,'');
+    if(clean.length<2)return res.status(400).json({error:'Username too short or invalid'});
+    if(db.prepare('SELECT id FROM users WHERE username=?').get(clean))return res.status(409).json({error:'Username already taken'});
+    if(email&&db.prepare('SELECT id FROM users WHERE email=?').get(email.toLowerCase()))return res.status(409).json({error:'Email already registered'});
+    const id=uuidv4(),hash=bcrypt.hashSync(password,10);
+    const emojis=['🧑','👩','👨','🧔','👱','🧑‍💻','👩‍💻','🧑‍🎤','🧑‍🚀','👾','🐱','🦊','🐼','🦁'];
+    const emoji=emojis[Math.floor(Math.random()*emojis.length)];
+    db.prepare('INSERT INTO users(id,username,email,display_name,password_hash,avatar_emoji)VALUES(?,?,?,?,?,?)').run(id,clean,email?email.toLowerCase():null,displayName||clean,hash,emoji);
+    db.prepare('INSERT INTO user_settings(user_id)VALUES(?)').run(id);
+    db.prepare('SELECT id FROM servers WHERE is_public=1').all().forEach(s=>db.prepare('INSERT OR IGNORE INTO server_members(server_id,user_id)VALUES(?,?)').run(s.id,id));
+    const sessId=uuidv4();
+    db.prepare('INSERT INTO sessions(id,user_id,expires_at)VALUES(?,?,?)').run(sessId,id,Math.floor(Date.now()/1000)+86400*30);
+    res.cookie('mc_sess',sessId,{httpOnly:true,maxAge:86400*30*1000,sameSite:'lax'});
+    const u=db.prepare('SELECT * FROM users WHERE id=?').get(id);
+    broadcast(null,{type:'USER_JOIN',user:su(u)});
+    res.json(su(u));
+  }catch(e){console.error(e);res.status(500).json({error:'Server error: '+e.message});}
 });
 
-app.post('/api/auth/login', (req, res) => {
-  const { username, password } = req.body;
-  const u = db.prepare('SELECT * FROM users WHERE username=?').get(username?.toLowerCase());
-  if (!u || !bcrypt.compareSync(password, u.password_hash))
-    return res.status(401).json({ error: 'Invalid credentials' });
-  db.prepare('UPDATE users SET status=? WHERE id=?').run('online', u.id);
-  const sessionId = uuidv4();
-  db.prepare('INSERT INTO sessions (id,user_id,expires_at) VALUES (?,?,?)').run(sessionId, u.id, Math.floor(Date.now()/1000)+86400*30);
-  res.cookie('mc_session', sessionId, { httpOnly: true, maxAge: 86400*30*1000, sameSite: 'lax' });
-  broadcast(null, { type: 'USER_STATUS', userId: u.id, status: 'online' });
-  res.json({ id: u.id, username: u.username, displayName: u.display_name, avatar: u.avatar, status: 'online', customStatus: u.custom_status });
+app.post('/api/auth/login',(req,res)=>{
+  try{
+    const{username,password}=req.body;
+    const u=db.prepare('SELECT * FROM users WHERE username=? OR email=?').get(username?.toLowerCase(),username?.toLowerCase());
+    if(!u||!bcrypt.compareSync(password,u.password_hash))return res.status(401).json({error:'Invalid credentials'});
+    db.prepare('UPDATE users SET status=? WHERE id=?').run('online',u.id);
+    const sessId=uuidv4();
+    db.prepare('INSERT INTO sessions(id,user_id,expires_at)VALUES(?,?,?)').run(sessId,u.id,Math.floor(Date.now()/1000)+86400*30);
+    res.cookie('mc_sess',sessId,{httpOnly:true,maxAge:86400*30*1000,sameSite:'lax'});
+    broadcast(null,{type:'USER_STATUS',userId:u.id,status:'online'});
+    res.json(su(u));
+  }catch(e){res.status(500).json({error:'Server error'});}
 });
 
-app.post('/api/auth/logout', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM sessions WHERE id=?').run(req.cookies.mc_session);
-  db.prepare('UPDATE users SET status=? WHERE id=?').run('offline', req.user.uid);
-  res.clearCookie('mc_session');
-  broadcast(null, { type: 'USER_STATUS', userId: req.user.uid, status: 'offline' });
-  res.json({ ok: true });
+app.post('/api/auth/logout',auth,(req,res)=>{
+  db.prepare('DELETE FROM sessions WHERE id=?').run(req.cookies.mc_sess);
+  db.prepare('UPDATE users SET status=? WHERE id=?').run('offline',req.user.id);
+  res.clearCookie('mc_sess');broadcast(null,{type:'USER_STATUS',userId:req.user.id,status:'offline'});res.json({ok:true});
 });
 
-app.get('/api/auth/me', requireAuth, (req, res) => {
-  const u = req.user;
-  res.json({ id: u.uid, username: u.username, displayName: u.display_name, avatar: u.avatar, status: u.status, customStatus: u.custom_status });
+app.get('/api/auth/me',auth,(req,res)=>{
+  const u=db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  const settings=db.prepare('SELECT * FROM user_settings WHERE user_id=?').get(u.id)||{};
+  res.json({...su(u),settings});
 });
 
-// ─── Users ────────────────────────────────────────────────────────────────────
-app.get('/api/users', requireAuth, (req, res) => {
-  const users = db.prepare(`SELECT id,username,display_name,avatar,status,custom_status FROM users WHERE id!='system'`).all();
-  res.json(users.map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatar: u.avatar, status: u.status, customStatus: u.custom_status })));
+// USERS
+app.get('/api/users',auth,(req,res)=>{
+  res.json(db.prepare("SELECT * FROM users WHERE id!='system-bot'").all().map(su));
+});
+app.get('/api/users/search',auth,(req,res)=>{
+  const{q}=req.query;if(!q||q.length<2)return res.json([]);
+  res.json(db.prepare("SELECT * FROM users WHERE(username LIKE ? OR display_name LIKE ?)AND id!=? AND id!='system-bot' LIMIT 20").all(`%${q}%`,`%${q}%`,req.user.id).map(su));
+});
+app.patch('/api/users/me',auth,(req,res)=>{
+  const{displayName,avatarEmoji,status,customStatus,bio}=req.body,uid=req.user.id;
+  if(displayName)db.prepare('UPDATE users SET display_name=? WHERE id=?').run(displayName,uid);
+  if(avatarEmoji)db.prepare('UPDATE users SET avatar_emoji=? WHERE id=?').run(avatarEmoji,uid);
+  if(status)db.prepare('UPDATE users SET status=? WHERE id=?').run(status,uid);
+  if(customStatus!==undefined)db.prepare('UPDATE users SET custom_status=? WHERE id=?').run(customStatus,uid);
+  if(bio!==undefined)db.prepare('UPDATE users SET bio=? WHERE id=?').run(bio,uid);
+  const u=db.prepare('SELECT * FROM users WHERE id=?').get(uid);
+  broadcast(null,{type:'USER_UPDATE',user:su(u)});res.json(su(u));
+});
+app.post('/api/users/me/avatar',auth,upload.single('image'),(req,res)=>{
+  if(!req.file)return res.status(400).json({error:'No image'});
+  const url='/uploads/'+req.file.filename;
+  db.prepare('UPDATE users SET avatar=? WHERE id=?').run(url,req.user.id);
+  const u=db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  broadcast(null,{type:'USER_UPDATE',user:su(u)});res.json({url});
+});
+app.post('/api/users/me/banner',auth,upload.single('image'),(req,res)=>{
+  if(!req.file)return res.status(400).json({error:'No image'});
+  const url='/uploads/'+req.file.filename;
+  db.prepare('UPDATE users SET banner=? WHERE id=?').run(url,req.user.id);
+  res.json({url});
+});
+app.get('/api/users/me/settings',auth,(req,res)=>res.json(db.prepare('SELECT * FROM user_settings WHERE user_id=?').get(req.user.id)||{}));
+app.patch('/api/users/me/settings',auth,(req,res)=>{
+  const{theme_bg,theme_bg_blur,theme_bg_dim,notifications}=req.body;
+  db.prepare('INSERT INTO user_settings(user_id,theme_bg,theme_bg_blur,theme_bg_dim,notifications)VALUES(?,?,?,?,?)ON CONFLICT(user_id)DO UPDATE SET theme_bg=excluded.theme_bg,theme_bg_blur=excluded.theme_bg_blur,theme_bg_dim=excluded.theme_bg_dim,notifications=excluded.notifications').run(req.user.id,theme_bg||null,theme_bg_blur||0,theme_bg_dim||40,notifications!==undefined?notifications:1);
+  res.json({ok:true});
+});
+app.post('/api/users/me/theme-bg',auth,upload.single('image'),(req,res)=>{
+  if(!req.file)return res.status(400).json({error:'No image'});
+  const url='/uploads/'+req.file.filename;
+  db.prepare('INSERT INTO user_settings(user_id,theme_bg)VALUES(?,?)ON CONFLICT(user_id)DO UPDATE SET theme_bg=excluded.theme_bg').run(req.user.id,url);
+  res.json({url});
 });
 
-app.patch('/api/users/me', requireAuth, (req, res) => {
-  const { displayName, avatar, status, customStatus } = req.body;
-  const uid = req.user.uid;
-  if (displayName) db.prepare('UPDATE users SET display_name=? WHERE id=?').run(displayName, uid);
-  if (avatar) db.prepare('UPDATE users SET avatar=? WHERE id=?').run(avatar, uid);
-  if (status) db.prepare('UPDATE users SET status=? WHERE id=?').run(status, uid);
-  if (customStatus !== undefined) db.prepare('UPDATE users SET custom_status=? WHERE id=?').run(customStatus, uid);
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(uid);
-  broadcast(null, { type: 'USER_UPDATE', user: { id: uid, displayName: u.display_name, avatar: u.avatar, status: u.status, customStatus: u.custom_status } });
-  res.json({ ok: true });
+// SERVERS
+app.get('/api/servers',auth,(req,res)=>{
+  res.json(db.prepare('SELECT s.* FROM servers s JOIN server_members sm ON s.id=sm.server_id WHERE sm.user_id=? ORDER BY s.created_at').all(req.user.id).map(s=>ss(s,req.user.id)));
 });
-
-// ─── Servers ──────────────────────────────────────────────────────────────────
-app.get('/api/servers', requireAuth, (req, res) => {
-  const srvs = db.prepare(`SELECT s.* FROM servers s JOIN server_members sm ON s.id=sm.server_id WHERE sm.user_id=? ORDER BY s.created_at`).all(req.user.uid);
-  res.json(srvs.map(s => ({
-    id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id,
-    channels: db.prepare('SELECT * FROM channels WHERE server_id=? ORDER BY position').all(s.id).map(c => ({ id: c.id, name: c.name, type: c.type, topic: c.topic, position: c.position })),
-    members: db.prepare(`SELECT u.id,u.username,u.display_name,u.avatar,u.status,u.custom_status,sm.role FROM server_members sm JOIN users u ON sm.user_id=u.id WHERE sm.server_id=? AND u.id!='system'`).all(s.id).map(m => ({ id: m.id, username: m.username, displayName: m.display_name, avatar: m.avatar, status: m.status, customStatus: m.custom_status, role: m.role }))
-  })));
+app.get('/api/servers/discover',auth,(req,res)=>{
+  res.json(db.prepare('SELECT s.* FROM servers s WHERE s.is_public=1 ORDER BY(SELECT COUNT(*)FROM server_members sm WHERE sm.server_id=s.id)DESC LIMIT 50').all().map(s=>ss(s,req.user.id)));
 });
-
-app.post('/api/servers', requireAuth, (req, res) => {
-  const { name, icon } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name required' });
-  const id = uuidv4(); const c1 = uuidv4(); const c2 = uuidv4();
-  db.prepare('INSERT INTO servers (id,name,icon,owner_id) VALUES (?,?,?,?)').run(id, name, icon||'🌐', req.user.uid);
-  db.prepare('INSERT INTO channels (id,server_id,name,type,topic,position) VALUES (?,?,?,?,?,?)').run(c1, id, 'general', 'text', 'General chat', 0);
-  db.prepare('INSERT INTO channels (id,server_id,name,type,topic,position) VALUES (?,?,?,?,?,?)').run(c2, id, 'General', 'voice', '', 1);
-  db.prepare('INSERT INTO server_members (server_id,user_id,role) VALUES (?,?,?)').run(id, req.user.uid, 'admin');
-  const srv = { id, name, icon: icon||'🌐', ownerId: req.user.uid, channels: [{ id: c1, name: 'general', type: 'text', topic: 'General chat', position: 0 }, { id: c2, name: 'General', type: 'voice', topic: '', position: 1 }], members: [] };
-  broadcast(null, { type: 'SERVER_CREATE', server: srv });
+app.get('/api/servers/:id',auth,(req,res)=>{
+  const s=db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if(!s)return res.status(404).json({error:'Not found'});res.json(ss(s,req.user.id));
+});
+app.post('/api/servers',auth,(req,res)=>{
+  const{name,iconEmoji,description,isPublic}=req.body;
+  if(!name?.trim())return res.status(400).json({error:'Name required'});
+  const id=uuidv4(),c1=uuidv4(),c2=uuidv4();
+  db.prepare('INSERT INTO servers(id,name,icon_emoji,description,owner_id,is_public)VALUES(?,?,?,?,?,?)').run(id,name.trim(),iconEmoji||'🌐',description||'',req.user.id,isPublic!==false?1:0);
+  db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position)VALUES(?,?,?,?,?,?)').run(c1,id,'general','text','General chat',0);
+  db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position)VALUES(?,?,?,?,?,?)').run(c2,id,'General','voice','',1);
+  db.prepare('INSERT INTO server_members(server_id,user_id,role)VALUES(?,?,?)').run(id,req.user.id,'admin');
+  const srv=ss(db.prepare('SELECT * FROM servers WHERE id=?').get(id),req.user.id);
+  broadcast(null,{type:'SERVER_CREATED',server:srv});res.json(srv);
+});
+app.patch('/api/servers/:id',auth,(req,res)=>{
+  const{name,iconEmoji,description,isPublic}=req.body;
+  const mem=db.prepare('SELECT role FROM server_members WHERE server_id=? AND user_id=?').get(req.params.id,req.user.id);
+  if(!mem||mem.role!=='admin')return res.status(403).json({error:'Not admin'});
+  if(name)db.prepare('UPDATE servers SET name=? WHERE id=?').run(name,req.params.id);
+  if(iconEmoji)db.prepare('UPDATE servers SET icon_emoji=? WHERE id=?').run(iconEmoji,req.params.id);
+  if(description!==undefined)db.prepare('UPDATE servers SET description=? WHERE id=?').run(description,req.params.id);
+  if(isPublic!==undefined)db.prepare('UPDATE servers SET is_public=? WHERE id=?').run(isPublic?1:0,req.params.id);
+  const srv=ss(db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id),req.user.id);
+  broadcast(req.params.id,{type:'SERVER_UPDATE',server:srv});res.json(srv);
+});
+app.post('/api/servers/:id/icon',auth,upload.single('image'),(req,res)=>{
+  const mem=db.prepare('SELECT role FROM server_members WHERE server_id=? AND user_id=?').get(req.params.id,req.user.id);
+  if(!mem||mem.role!=='admin')return res.status(403).json({error:'Not admin'});
+  if(!req.file)return res.status(400).json({error:'No image'});
+  const url='/uploads/'+req.file.filename;
+  db.prepare('UPDATE servers SET icon=? WHERE id=?').run(url,req.params.id);
+  broadcast(req.params.id,{type:'SERVER_UPDATE',server:ss(db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id),req.user.id)});
+  res.json({url});
+});
+app.post('/api/servers/:id/banner',auth,upload.single('image'),(req,res)=>{
+  const mem=db.prepare('SELECT role FROM server_members WHERE server_id=? AND user_id=?').get(req.params.id,req.user.id);
+  if(!mem||mem.role!=='admin')return res.status(403).json({error:'Not admin'});
+  if(!req.file)return res.status(400).json({error:'No image'});
+  const url='/uploads/'+req.file.filename;
+  db.prepare('UPDATE servers SET banner=? WHERE id=?').run(url,req.params.id);
+  broadcast(req.params.id,{type:'SERVER_UPDATE',server:ss(db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id),req.user.id)});
+  res.json({url});
+});
+app.post('/api/servers/:id/join',auth,(req,res)=>{
+  const s=db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if(!s)return res.status(404).json({error:'Not found'});
+  db.prepare('INSERT OR IGNORE INTO server_members(server_id,user_id)VALUES(?,?)').run(req.params.id,req.user.id);
+  const srv=ss(s,req.user.id);
+  sendToUser(req.user.id,{type:'SERVER_JOINED',server:srv});
+  broadcast(req.params.id,{type:'MEMBER_JOIN',serverId:req.params.id,userId:req.user.id});
   res.json(srv);
 });
-
-app.post('/api/servers/:id/join', requireAuth, (req, res) => {
-  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
-  if (!s) return res.status(404).json({ error: 'Not found' });
-  db.prepare('INSERT OR IGNORE INTO server_members (server_id,user_id) VALUES (?,?)').run(req.params.id, req.user.uid);
-  broadcast(req.params.id, { type: 'MEMBER_JOIN', serverId: req.params.id, userId: req.user.uid });
-  res.json({ ok: true });
+app.delete('/api/servers/:id/leave',auth,(req,res)=>{
+  db.prepare('DELETE FROM server_members WHERE server_id=? AND user_id=?').run(req.params.id,req.user.id);
+  broadcast(req.params.id,{type:'MEMBER_LEAVE',serverId:req.params.id,userId:req.user.id});
+  res.json({ok:true});
+});
+app.get('/api/invite/:id',(req,res)=>{
+  const s=db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if(!s)return res.status(404).json({error:'Not found'});
+  res.json({serverId:s.id,name:s.name,icon:s.icon,iconEmoji:s.icon_emoji,description:s.description,memberCount:db.prepare('SELECT COUNT(*)as c FROM server_members WHERE server_id=?').get(s.id).c});
 });
 
-app.delete('/api/servers/:id/leave', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM server_members WHERE server_id=? AND user_id=?').run(req.params.id, req.user.uid);
-  res.json({ ok: true });
+// CHANNELS
+app.post('/api/servers/:sid/channels',auth,(req,res)=>{
+  const{name,type,topic}=req.body;if(!name?.trim())return res.status(400).json({error:'Name required'});
+  const id=uuidv4(),pos=(db.prepare('SELECT MAX(position)as m FROM channels WHERE server_id=?').get(req.params.sid).m||0)+1;
+  db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position)VALUES(?,?,?,?,?,?)').run(id,req.params.sid,name.trim(),type||'text',topic||'',pos);
+  const ch={id,name:name.trim(),type:type||'text',topic:topic||'',position:pos};
+  broadcast(req.params.sid,{type:'CHANNEL_CREATE',serverId:req.params.sid,channel:ch});res.json(ch);
 });
-
-// ─── Channels ─────────────────────────────────────────────────────────────────
-app.post('/api/servers/:sid/channels', requireAuth, (req, res) => {
-  const { name, type, topic } = req.body;
-  const id = uuidv4();
-  const pos = (db.prepare('SELECT MAX(position) as m FROM channels WHERE server_id=?').get(req.params.sid).m || 0) + 1;
-  db.prepare('INSERT INTO channels (id,server_id,name,type,topic,position) VALUES (?,?,?,?,?,?)').run(id, req.params.sid, name, type||'text', topic||'', pos);
-  const ch = { id, name, type: type||'text', topic: topic||'', position: pos };
-  broadcast(req.params.sid, { type: 'CHANNEL_CREATE', serverId: req.params.sid, channel: ch });
-  res.json(ch);
+app.patch('/api/channels/:id',auth,(req,res)=>{
+  const{name,topic}=req.body;
+  if(name)db.prepare('UPDATE channels SET name=? WHERE id=?').run(name,req.params.id);
+  if(topic!==undefined)db.prepare('UPDATE channels SET topic=? WHERE id=?').run(topic,req.params.id);
+  res.json({ok:true});
 });
-
-app.patch('/api/channels/:id', requireAuth, (req, res) => {
-  const { name, topic } = req.body;
-  if (name) db.prepare('UPDATE channels SET name=? WHERE id=?').run(name, req.params.id);
-  if (topic !== undefined) db.prepare('UPDATE channels SET topic=? WHERE id=?').run(topic, req.params.id);
-  res.json({ ok: true });
-});
-
-app.delete('/api/channels/:id', requireAuth, (req, res) => {
-  const ch = db.prepare('SELECT * FROM channels WHERE id=?').get(req.params.id);
-  if (!ch) return res.status(404).json({ error: 'Not found' });
+app.delete('/api/channels/:id',auth,(req,res)=>{
+  const ch=db.prepare('SELECT * FROM channels WHERE id=?').get(req.params.id);
+  if(!ch)return res.status(404).json({error:'Not found'});
   db.prepare('DELETE FROM channels WHERE id=?').run(req.params.id);
-  broadcast(ch.server_id, { type: 'CHANNEL_DELETE', serverId: ch.server_id, channelId: req.params.id });
-  res.json({ ok: true });
+  broadcast(ch.server_id,{type:'CHANNEL_DELETE',serverId:ch.server_id,channelId:req.params.id});res.json({ok:true});
 });
 
-// ─── Messages ─────────────────────────────────────────────────────────────────
-app.get('/api/channels/:id/messages', requireAuth, (req, res) => {
-  const msgs = db.prepare(`SELECT m.*,u.display_name,u.avatar FROM messages m JOIN users u ON m.author_id=u.id WHERE m.channel_id=? ORDER BY m.created_at DESC LIMIT 100`).all(req.params.id).reverse();
-  res.json(msgs.map(m => {
-    const rxns = db.prepare('SELECT emoji,user_id FROM reactions WHERE message_id=?').all(m.id);
-    const grouped = {};
-    rxns.forEach(r => { if (!grouped[r.emoji]) grouped[r.emoji] = []; grouped[r.emoji].push(r.user_id); });
-    return { id: m.id, channelId: m.channel_id, authorId: m.author_id, authorName: m.display_name, authorAvatar: m.avatar, content: m.content, pinned: !!m.pinned, edited: !!m.edited, replyTo: m.reply_to, timestamp: m.created_at, reactions: grouped };
-  }));
+// MESSAGES
+app.get('/api/channels/:id/messages',auth,(req,res)=>{
+  const{before,limit=60}=req.query;
+  let q='SELECT * FROM messages WHERE channel_id=?';const p=[req.params.id];
+  if(before){q+=' AND created_at<?';p.push(before);}
+  q+=' ORDER BY created_at DESC LIMIT ?';p.push(parseInt(limit));
+  res.json(db.prepare(q).all(...p).reverse().map(sm));
 });
-
-app.post('/api/channels/:id/messages', requireAuth, (req, res) => {
-  const { content, replyTo } = req.body;
-  if (!content?.trim()) return res.status(400).json({ error: 'Empty' });
-  const id = uuidv4(); const ts = Date.now();
-  db.prepare('INSERT INTO messages (id,channel_id,author_id,content,reply_to,created_at) VALUES (?,?,?,?,?,?)').run(id, req.params.id, req.user.uid, content.trim(), replyTo||null, ts);
-  const ch = db.prepare('SELECT server_id FROM channels WHERE id=?').get(req.params.id);
-  const msg = { id, channelId: req.params.id, authorId: req.user.uid, authorName: req.user.display_name, authorAvatar: req.user.avatar, content: content.trim(), pinned: false, edited: false, replyTo: replyTo||null, timestamp: ts, reactions: {} };
-  broadcast(ch?.server_id, { type: 'MESSAGE_CREATE', message: msg });
-  res.json(msg);
+app.post('/api/channels/:id/messages',auth,upload.single('attachment'),(req,res)=>{
+  const{content,replyTo}=req.body;
+  if(!content?.trim()&&!req.file)return res.status(400).json({error:'Empty'});
+  const id=uuidv4(),ts=Date.now();
+  const attUrl=req.file?'/uploads/'+req.file.filename:null;
+  const attType=req.file?req.file.mimetype:null;
+  db.prepare('INSERT INTO messages(id,channel_id,author_id,content,attachment_url,attachment_type,reply_to,created_at)VALUES(?,?,?,?,?,?,?,?)').run(id,req.params.id,req.user.id,(content||'').trim(),attUrl,attType,replyTo||null,ts);
+  const ch=db.prepare('SELECT server_id FROM channels WHERE id=?').get(req.params.id);
+  const msg=sm(db.prepare('SELECT * FROM messages WHERE id=?').get(id));
+  broadcast(ch?.server_id,{type:'MESSAGE_CREATE',message:msg});res.json(msg);
 });
-
-app.patch('/api/messages/:id', requireAuth, (req, res) => {
-  const msg = db.prepare('SELECT * FROM messages WHERE id=? AND author_id=?').get(req.params.id, req.user.uid);
-  if (!msg) return res.status(403).json({ error: 'Forbidden' });
-  db.prepare('UPDATE messages SET content=?,edited=1 WHERE id=?').run(req.body.content, req.params.id);
-  const ch = db.prepare('SELECT server_id FROM channels WHERE id=?').get(msg.channel_id);
-  broadcast(ch?.server_id, { type: 'MESSAGE_UPDATE', messageId: req.params.id, channelId: msg.channel_id, content: req.body.content, edited: true });
-  res.json({ ok: true });
+app.patch('/api/messages/:id',auth,(req,res)=>{
+  const msg=db.prepare('SELECT * FROM messages WHERE id=? AND author_id=?').get(req.params.id,req.user.id);
+  if(!msg)return res.status(403).json({error:'Forbidden'});
+  db.prepare('UPDATE messages SET content=?,edited=1 WHERE id=?').run(req.body.content,req.params.id);
+  const ch=db.prepare('SELECT server_id FROM channels WHERE id=?').get(msg.channel_id);
+  broadcast(ch?.server_id,{type:'MESSAGE_UPDATE',messageId:req.params.id,channelId:msg.channel_id,content:req.body.content});res.json({ok:true});
 });
-
-app.delete('/api/messages/:id', requireAuth, (req, res) => {
-  const msg = db.prepare('SELECT m.*,c.server_id FROM messages m JOIN channels c ON m.channel_id=c.id WHERE m.id=?').get(req.params.id);
-  if (!msg) return res.status(404).json({ error: 'Not found' });
-  const isAdmin = db.prepare('SELECT role FROM server_members WHERE server_id=? AND user_id=?').get(msg.server_id, req.user.uid);
-  if (msg.author_id !== req.user.uid && isAdmin?.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+app.delete('/api/messages/:id',auth,(req,res)=>{
+  const msg=db.prepare('SELECT m.*,c.server_id FROM messages m JOIN channels c ON m.channel_id=c.id WHERE m.id=?').get(req.params.id);
+  if(!msg)return res.status(404).json({error:'Not found'});
+  const isAdmin=db.prepare('SELECT role FROM server_members WHERE server_id=? AND user_id=?').get(msg.server_id,req.user.id);
+  if(msg.author_id!==req.user.id&&isAdmin?.role!=='admin')return res.status(403).json({error:'Forbidden'});
   db.prepare('DELETE FROM messages WHERE id=?').run(req.params.id);
   db.prepare('DELETE FROM reactions WHERE message_id=?').run(req.params.id);
-  broadcast(msg.server_id, { type: 'MESSAGE_DELETE', messageId: req.params.id, channelId: msg.channel_id });
-  res.json({ ok: true });
+  broadcast(msg.server_id,{type:'MESSAGE_DELETE',messageId:req.params.id,channelId:msg.channel_id});res.json({ok:true});
+});
+app.post('/api/messages/:id/pin',auth,(req,res)=>{
+  const msg=db.prepare('SELECT m.*,c.server_id FROM messages m JOIN channels c ON m.channel_id=c.id WHERE m.id=?').get(req.params.id);
+  if(!msg)return res.status(404).json({error:'Not found'});
+  const pinned=!msg.pinned;
+  db.prepare('UPDATE messages SET pinned=? WHERE id=?').run(pinned?1:0,req.params.id);
+  broadcast(msg.server_id,{type:'MESSAGE_PIN',messageId:req.params.id,channelId:msg.channel_id,pinned});res.json({ok:true});
+});
+app.post('/api/messages/:id/react',auth,(req,res)=>{
+  const{emoji}=req.body;
+  const ex=db.prepare('SELECT * FROM reactions WHERE message_id=? AND user_id=? AND emoji=?').get(req.params.id,req.user.id,emoji);
+  if(ex)db.prepare('DELETE FROM reactions WHERE message_id=? AND user_id=? AND emoji=?').run(req.params.id,req.user.id,emoji);
+  else db.prepare('INSERT INTO reactions(message_id,user_id,emoji)VALUES(?,?,?)').run(req.params.id,req.user.id,emoji);
+  const all=db.prepare('SELECT emoji,user_id FROM reactions WHERE message_id=?').all(req.params.id);
+  const g={};all.forEach(r=>{if(!g[r.emoji])g[r.emoji]=[];g[r.emoji].push(r.user_id);});
+  const ch=db.prepare('SELECT c.server_id FROM messages m JOIN channels c ON m.channel_id=c.id WHERE m.id=?').get(req.params.id);
+  broadcast(ch?.server_id,{type:'REACTION_UPDATE',messageId:req.params.id,reactions:g});res.json({reactions:g});
 });
 
-app.post('/api/messages/:id/pin', requireAuth, (req, res) => {
-  const msg = db.prepare('SELECT m.*,c.server_id FROM messages m JOIN channels c ON m.channel_id=c.id WHERE m.id=?').get(req.params.id);
-  if (!msg) return res.status(404).json({ error: 'Not found' });
-  const pinned = !msg.pinned;
-  db.prepare('UPDATE messages SET pinned=? WHERE id=?').run(pinned?1:0, req.params.id);
-  broadcast(msg.server_id, { type: 'MESSAGE_PIN', messageId: req.params.id, channelId: msg.channel_id, pinned });
-  res.json({ ok: true });
+// DMs
+app.get('/api/dm/:uid',auth,(req,res)=>{
+  const msgs=db.prepare('SELECT * FROM direct_messages WHERE(from_user=? AND to_user=?)OR(from_user=? AND to_user=?)ORDER BY created_at ASC LIMIT 100').all(req.user.id,req.params.uid,req.params.uid,req.user.id);
+  res.json(msgs.map(m=>{const u=db.prepare('SELECT * FROM users WHERE id=?').get(m.from_user);return{id:m.id,authorId:m.from_user,authorName:u?.display_name||'?',authorAvatar:u?.avatar,authorAvatarEmoji:u?.avatar_emoji||'👤',content:m.content,attachmentUrl:m.attachment_url,attachmentType:m.attachment_type,timestamp:m.created_at,edited:!!m.edited};}));
+});
+app.post('/api/dm/:uid',auth,upload.single('attachment'),(req,res)=>{
+  const{content}=req.body;if(!content?.trim()&&!req.file)return res.status(400).json({error:'Empty'});
+  const id=uuidv4(),ts=Date.now();
+  const attUrl=req.file?'/uploads/'+req.file.filename:null,attType=req.file?req.file.mimetype:null;
+  db.prepare('INSERT INTO direct_messages(id,from_user,to_user,content,attachment_url,attachment_type,created_at)VALUES(?,?,?,?,?,?,?)').run(id,req.user.id,req.params.uid,(content||'').trim(),attUrl,attType,ts);
+  const u=db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  const msg={id,authorId:req.user.id,authorName:u.display_name,authorAvatar:u.avatar,authorAvatarEmoji:u.avatar_emoji,content:(content||'').trim(),attachmentUrl:attUrl,attachmentType:attType,timestamp:ts,edited:false};
+  broadcastToUsers([req.user.id,req.params.uid],{type:'DM_CREATE',toUserId:req.params.uid,fromUserId:req.user.id,message:msg});res.json(msg);
 });
 
-app.post('/api/messages/:id/react', requireAuth, (req, res) => {
-  const { emoji } = req.body;
-  const existing = db.prepare('SELECT * FROM reactions WHERE message_id=? AND user_id=? AND emoji=?').get(req.params.id, req.user.uid, emoji);
-  if (existing) db.prepare('DELETE FROM reactions WHERE message_id=? AND user_id=? AND emoji=?').run(req.params.id, req.user.uid, emoji);
-  else db.prepare('INSERT INTO reactions (message_id,user_id,emoji) VALUES (?,?,?)').run(req.params.id, req.user.uid, emoji);
-  const all = db.prepare('SELECT emoji,user_id FROM reactions WHERE message_id=?').all(req.params.id);
-  const grouped = {};
-  all.forEach(r => { if (!grouped[r.emoji]) grouped[r.emoji] = []; grouped[r.emoji].push(r.user_id); });
-  const ch = db.prepare('SELECT c.server_id FROM messages m JOIN channels c ON m.channel_id=c.id WHERE m.id=?').get(req.params.id);
-  broadcast(ch?.server_id, { type: 'REACTION_UPDATE', messageId: req.params.id, reactions: grouped });
-  res.json({ reactions: grouped });
+// FRIENDS
+app.get('/api/friends',auth,(req,res)=>{
+  const uid=req.user.id;
+  const rows=db.prepare('SELECT f.*,u.id as uid,u.username,u.display_name,u.avatar,u.avatar_emoji,u.status,u.custom_status FROM friendships f JOIN users u ON(CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END)=u.id WHERE f.requester_id=? OR f.addressee_id=? ORDER BY f.created_at DESC').all(uid,uid,uid);
+  res.json(rows.map(f=>({friendshipId:f.id,status:f.status,isRequester:f.requester_id===uid,user:{id:f.uid,username:f.username,displayName:f.display_name,avatar:f.avatar,avatarEmoji:f.avatar_emoji,status:f.status,customStatus:f.custom_status}})));
 });
-
-// ─── DMs ─────────────────────────────────────────────────────────────────────
-app.get('/api/dm/:uid', requireAuth, (req, res) => {
-  const msgs = db.prepare(`SELECT dm.*,u.display_name,u.avatar FROM direct_messages dm JOIN users u ON dm.from_user=u.id WHERE (dm.from_user=? AND dm.to_user=?) OR (dm.from_user=? AND dm.to_user=?) ORDER BY dm.created_at ASC LIMIT 100`).all(req.user.uid, req.params.uid, req.params.uid, req.user.uid);
-  res.json(msgs.map(m => ({ id: m.id, authorId: m.from_user, authorName: m.display_name, authorAvatar: m.avatar, content: m.content, timestamp: m.created_at, edited: !!m.edited, reactions: {} })));
-});
-
-app.post('/api/dm/:uid', requireAuth, (req, res) => {
-  const { content } = req.body;
-  if (!content?.trim()) return res.status(400).json({ error: 'Empty' });
-  const id = uuidv4(); const ts = Date.now();
-  db.prepare('INSERT INTO direct_messages (id,from_user,to_user,content,created_at) VALUES (?,?,?,?,?)').run(id, req.user.uid, req.params.uid, content.trim(), ts);
-  const msg = { id, authorId: req.user.uid, authorName: req.user.display_name, authorAvatar: req.user.avatar, content: content.trim(), timestamp: ts, edited: false, reactions: {} };
-  broadcastToUsers([req.user.uid, req.params.uid], { type: 'DM_CREATE', toUserId: req.params.uid, fromUserId: req.user.uid, message: msg });
-  res.json(msg);
-});
-
-// ─── Friends ──────────────────────────────────────────────────────────────────
-app.get('/api/friends', requireAuth, (req, res) => {
-  const friends = db.prepare(`SELECT u.id,u.username,u.display_name,u.avatar,u.status,u.custom_status FROM friendships f JOIN users u ON (CASE WHEN f.user_a=? THEN f.user_b ELSE f.user_a END)=u.id WHERE f.user_a=? OR f.user_b=?`).all(req.user.uid, req.user.uid, req.user.uid);
-  res.json(friends.map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatar: u.avatar, status: u.status, customStatus: u.custom_status, friendStatus: 'accepted' })));
-});
-
-app.post('/api/friends/:username', requireAuth, (req, res) => {
-  const target = db.prepare('SELECT * FROM users WHERE username=?').get(req.params.username.toLowerCase());
-  if (!target) return res.status(404).json({ error: 'User not found' });
-  if (target.id === req.user.uid) return res.status(400).json({ error: 'Cannot friend yourself' });
-  const [a, b] = [req.user.uid, target.id].sort();
-  db.prepare('INSERT OR IGNORE INTO friendships (user_a,user_b,status) VALUES (?,?,?)').run(a, b, 'accepted');
-  broadcastToUsers([target.id], { type: 'FRIEND_ADD', from: { id: req.user.uid, displayName: req.user.display_name, avatar: req.user.avatar } });
-  res.json({ ok: true });
-});
-
-app.get('/api/invite/:sid', requireAuth, (req, res) => {
-  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.sid);
-  if (!s) return res.status(404).json({ error: 'Not found' });
-  res.json({ serverId: s.id, serverName: s.name, icon: s.icon });
-});
-
-// ─── WebSocket + WebRTC Signaling ────────────────────────────────────────────
-// userId -> Set<ws>
-const userSockets = new Map();
-// ws -> userId
-const wsUsers = new Map();
-// channelId -> Map<userId, { muted, deafened, screensharing, video }>
-const voiceRooms = new Map();
-
-function broadcast(serverId, data) {
-  const msg = JSON.stringify(data);
-  if (serverId) {
-    const members = db.prepare('SELECT user_id FROM server_members WHERE server_id=?').all(serverId);
-    for (const m of members) {
-      const sockets = userSockets.get(m.user_id);
-      if (sockets) sockets.forEach(ws => { if (ws.readyState === 1) ws.send(msg); });
-    }
-  } else {
-    wss.clients.forEach(ws => { if (ws.readyState === 1) ws.send(msg); });
+app.post('/api/friends/request',auth,(req,res)=>{
+  const{username}=req.body;
+  const target=db.prepare('SELECT * FROM users WHERE username=?').get(username?.toLowerCase());
+  if(!target)return res.status(404).json({error:'User not found'});
+  if(target.id===req.user.id)return res.status(400).json({error:'Cannot friend yourself'});
+  const existing=db.prepare('SELECT * FROM friendships WHERE(requester_id=? AND addressee_id=?)OR(requester_id=? AND addressee_id=?)').get(req.user.id,target.id,target.id,req.user.id);
+  if(existing){
+    if(existing.status==='accepted')return res.status(409).json({error:'Already friends'});
+    if(existing.status==='pending')return res.status(409).json({error:'Request already pending'});
   }
-}
+  const id=uuidv4();
+  db.prepare('INSERT INTO friendships(id,requester_id,addressee_id,status)VALUES(?,?,?,?)').run(id,req.user.id,target.id,'pending');
+  const requester=db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  sendToUser(target.id,{type:'FRIEND_REQUEST',friendship:{friendshipId:id,status:'pending',isRequester:false,user:su(requester)}});
+  res.json({ok:true,friendshipId:id});
+});
+app.post('/api/friends/:id/accept',auth,(req,res)=>{
+  const f=db.prepare('SELECT * FROM friendships WHERE id=? AND addressee_id=?').get(req.params.id,req.user.id);
+  if(!f)return res.status(404).json({error:'Not found'});
+  db.prepare('UPDATE friendships SET status=? WHERE id=?').run('accepted',req.params.id);
+  const me=db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  sendToUser(f.requester_id,{type:'FRIEND_ACCEPTED',user:su(me),friendshipId:req.params.id});
+  res.json({ok:true});
+});
+app.post('/api/friends/:id/decline',auth,(req,res)=>{
+  db.prepare('DELETE FROM friendships WHERE id=? AND(addressee_id=? OR requester_id=?)').run(req.params.id,req.user.id,req.user.id);
+  res.json({ok:true});
+});
+app.delete('/api/friends/:userId',auth,(req,res)=>{
+  db.prepare('DELETE FROM friendships WHERE(requester_id=? AND addressee_id=?)OR(requester_id=? AND addressee_id=?)').run(req.user.id,req.params.userId,req.params.userId,req.user.id);
+  res.json({ok:true});
+});
 
-function broadcastToUsers(userIds, data) {
-  const msg = JSON.stringify(data);
-  for (const uid of userIds) {
-    const sockets = userSockets.get(uid);
-    if (sockets) sockets.forEach(ws => { if (ws.readyState === 1) ws.send(msg); });
-  }
+// WS + WebRTC
+const userSockets=new Map(),wsUsers=new Map(),voiceRooms=new Map();
+function broadcast(serverId,data){
+  const msg=JSON.stringify(data);
+  if(serverId){db.prepare('SELECT user_id FROM server_members WHERE server_id=?').all(serverId).forEach(m=>{const s=userSockets.get(m.user_id);if(s)s.forEach(ws=>{if(ws.readyState===1)ws.send(msg);});});}
+  else{wss.clients.forEach(ws=>{if(ws.readyState===1)ws.send(msg);});}
 }
+function broadcastToUsers(uids,data){const msg=JSON.stringify(data);uids.forEach(uid=>{const s=userSockets.get(uid);if(s)s.forEach(ws=>{if(ws.readyState===1)ws.send(msg);});});}
+function sendToUser(uid,data){const msg=JSON.stringify(data);const s=userSockets.get(uid);if(s)s.forEach(ws=>{if(ws.readyState===1)ws.send(msg);});}
+function getVCP(cid){const r=voiceRooms.get(cid);if(!r)return[];return Array.from(r.entries()).map(([uid,st])=>{const u=db.prepare('SELECT * FROM users WHERE id=?').get(uid);return{userId:uid,displayName:u?.display_name||'?',avatar:u?.avatar,avatarEmoji:u?.avatar_emoji||'👤',...st};});}
 
-function sendToUser(userId, data) {
-  const msg = JSON.stringify(data);
-  const sockets = userSockets.get(userId);
-  if (sockets) sockets.forEach(ws => { if (ws.readyState === 1) ws.send(msg); });
-}
-
-function getVoiceRoomParticipants(channelId) {
-  const room = voiceRooms.get(channelId);
-  if (!room) return [];
-  return Array.from(room.entries()).map(([uid, state]) => {
-    const u = db.prepare('SELECT * FROM users WHERE id=?').get(uid);
-    return { userId: uid, displayName: u?.display_name || 'Unknown', avatar: u?.avatar || '👤', ...state };
-  });
-}
-
-wss.on('connection', (ws, req) => {
-  const cookieStr = req.headers.cookie || '';
-  const match = cookieStr.match(/mc_session=([^;]+)/);
-  const sessionId = match?.[1];
-  if (!sessionId) { ws.close(); return; }
-  const session = db.prepare('SELECT * FROM sessions WHERE id=? AND expires_at>unixepoch()').get(sessionId);
-  if (!session) { ws.close(); return; }
-  const userId = session.user_id;
-  wsUsers.set(ws, userId);
-  if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+wss.on('connection',(ws,req)=>{
+  const c=req.headers.cookie||'',m=c.match(/mc_sess=([^;]+)/);
+  if(!m)return ws.close();
+  const sess=db.prepare('SELECT * FROM sessions WHERE id=? AND expires_at>unixepoch()').get(m[1]);
+  if(!sess)return ws.close();
+  const userId=sess.user_id;
+  wsUsers.set(ws,userId);
+  if(!userSockets.has(userId))userSockets.set(userId,new Set());
   userSockets.get(userId).add(ws);
-  db.prepare('UPDATE users SET status=? WHERE id=?').run('online', userId);
-  broadcast(null, { type: 'USER_STATUS', userId, status: 'online' });
+  db.prepare('UPDATE users SET status=? WHERE id=?').run('online',userId);
+  broadcast(null,{type:'USER_STATUS',userId,status:'online'});
 
-  ws.on('message', raw => {
-    try {
-      const data = JSON.parse(raw);
-      const uid = wsUsers.get(ws);
-      if (!uid) return;
-
-      switch (data.type) {
-        // ── Chat ──
-        case 'TYPING':
-          const user = db.prepare('SELECT display_name FROM users WHERE id=?').get(uid);
-          broadcast(data.serverId, { type: 'TYPING', channelId: data.channelId, userId: uid, displayName: user?.display_name });
-          break;
-
-        // ── Voice: join channel ──
-        case 'VOICE_JOIN': {
-          const { channelId, serverId } = data;
-          // Leave any existing voice room
-          voiceRooms.forEach((room, chId) => {
-            if (room.has(uid)) {
-              room.delete(uid);
-              broadcast(serverId, { type: 'VOICE_LEAVE', channelId: chId, userId: uid });
-              broadcast(serverId, { type: 'VOICE_ROOM_UPDATE', channelId: chId, participants: getVoiceRoomParticipants(chId) });
-            }
-          });
-          if (!voiceRooms.has(channelId)) voiceRooms.set(channelId, new Map());
-          const room = voiceRooms.get(channelId);
-          const existingUsers = Array.from(room.keys());
-          room.set(uid, { muted: false, deafened: false, screensharing: false, video: false });
-          // Notify others in room to initiate WebRTC connection to new user
-          for (const existingUid of existingUsers) {
-            sendToUser(existingUid, { type: 'VOICE_USER_JOINED', channelId, userId: uid });
-            // Tell new user to create offers to everyone already there
-            sendToUser(uid, { type: 'VOICE_INITIATE_OFFER', channelId, targetUserId: existingUid });
-          }
-          broadcast(serverId, { type: 'VOICE_JOIN', channelId, userId: uid });
-          broadcast(serverId, { type: 'VOICE_ROOM_UPDATE', channelId, participants: getVoiceRoomParticipants(channelId) });
-          break;
+  ws.on('message',raw=>{
+    try{
+      const d=JSON.parse(raw),uid=wsUsers.get(ws);if(!uid)return;
+      switch(d.type){
+        case 'TYPING':{const u=db.prepare('SELECT display_name FROM users WHERE id=?').get(uid);broadcast(d.serverId,{type:'TYPING',channelId:d.channelId,userId:uid,displayName:u?.display_name});break;}
+        case 'VOICE_JOIN':{
+          voiceRooms.forEach((room,chId)=>{if(room.has(uid)){room.delete(uid);const s=db.prepare('SELECT server_id FROM channels WHERE id=?').get(chId);broadcast(s?.server_id,{type:'VOICE_LEAVE',channelId:chId,userId:uid});broadcast(s?.server_id,{type:'VOICE_ROOM_UPDATE',channelId:chId,participants:getVCP(chId)});}});
+          if(!voiceRooms.has(d.channelId))voiceRooms.set(d.channelId,new Map());
+          const room=voiceRooms.get(d.channelId),existing=Array.from(room.keys());
+          room.set(uid,{muted:false,deafened:false,screensharing:false,video:false});
+          existing.forEach(eUid=>{sendToUser(eUid,{type:'RTC_USER_JOINED',channelId:d.channelId,userId:uid});sendToUser(uid,{type:'RTC_SEND_OFFER',channelId:d.channelId,targetUserId:eUid});});
+          broadcast(d.serverId,{type:'VOICE_JOIN',channelId:d.channelId,userId:uid});
+          broadcast(d.serverId,{type:'VOICE_ROOM_UPDATE',channelId:d.channelId,participants:getVCP(d.channelId)});break;
         }
-
-        // ── Voice: leave channel ──
-        case 'VOICE_LEAVE': {
-          const { channelId, serverId } = data;
-          const room = voiceRooms.get(channelId);
-          if (room) {
-            room.delete(uid);
-            if (room.size === 0) voiceRooms.delete(channelId);
-          }
-          broadcast(serverId, { type: 'VOICE_LEAVE', channelId, userId: uid });
-          broadcast(serverId, { type: 'VOICE_ROOM_UPDATE', channelId, participants: getVoiceRoomParticipants(channelId) });
-          break;
+        case 'VOICE_LEAVE':{
+          const room=voiceRooms.get(d.channelId);if(room){room.delete(uid);if(!room.size)voiceRooms.delete(d.channelId);}
+          broadcast(d.serverId,{type:'VOICE_LEAVE',channelId:d.channelId,userId:uid});
+          broadcast(d.serverId,{type:'VOICE_ROOM_UPDATE',channelId:d.channelId,participants:getVCP(d.channelId)});break;
         }
-
-        // ── Voice: state update (mute/deafen/screenshare) ──
-        case 'VOICE_STATE': {
-          const { channelId, serverId, muted, deafened, screensharing, video } = data;
-          const room = voiceRooms.get(channelId);
-          if (room && room.has(uid)) {
-            room.set(uid, { muted, deafened, screensharing, video });
-            broadcast(serverId, { type: 'VOICE_STATE_UPDATE', channelId, userId: uid, muted, deafened, screensharing, video });
-            broadcast(serverId, { type: 'VOICE_ROOM_UPDATE', channelId, participants: getVoiceRoomParticipants(channelId) });
-          }
-          break;
+        case 'VOICE_STATE':{
+          const room=voiceRooms.get(d.channelId);
+          if(room?.has(uid))room.set(uid,{muted:d.muted,deafened:d.deafened,screensharing:d.screensharing,video:d.video});
+          broadcast(d.serverId,{type:'VOICE_STATE_UPDATE',channelId:d.channelId,userId:uid,muted:d.muted,deafened:d.deafened,screensharing:d.screensharing,video:d.video});
+          broadcast(d.serverId,{type:'VOICE_ROOM_UPDATE',channelId:d.channelId,participants:getVCP(d.channelId)});break;
         }
-
-        // ── WebRTC Signaling (relay between peers) ──
-        case 'RTC_OFFER':
-        case 'RTC_ANSWER':
-        case 'RTC_ICE':
-          // Relay directly to target user
-          if (data.targetUserId) {
-            sendToUser(data.targetUserId, { ...data, fromUserId: uid });
-          }
-          break;
+        case 'RTC_OFFER':case 'RTC_ANSWER':case 'RTC_ICE':
+          if(d.targetUserId)sendToUser(d.targetUserId,{...d,fromUserId:uid});break;
       }
-    } catch (e) { /* ignore parse errors */ }
+    }catch(e){}
   });
 
-  ws.on('close', () => {
-    const uid = wsUsers.get(ws);
-    wsUsers.delete(ws);
-    if (!uid) return;
-    const sockets = userSockets.get(uid);
-    if (sockets) {
-      sockets.delete(ws);
-      if (sockets.size === 0) {
-        userSockets.delete(uid);
-        // Remove from all voice rooms
-        voiceRooms.forEach((room, channelId) => {
-          if (room.has(uid)) {
-            room.delete(uid);
-            broadcast(null, { type: 'VOICE_LEAVE', channelId, userId: uid });
-            broadcast(null, { type: 'VOICE_ROOM_UPDATE', channelId, participants: getVoiceRoomParticipants(channelId) });
-          }
-        });
-        db.prepare('UPDATE users SET status=? WHERE id=?').run('offline', uid);
-        broadcast(null, { type: 'USER_STATUS', userId: uid, status: 'offline' });
-      }
-    }
+  ws.on('close',()=>{
+    const uid=wsUsers.get(ws);wsUsers.delete(ws);if(!uid)return;
+    const s=userSockets.get(uid);if(s){s.delete(ws);if(!s.size){
+      userSockets.delete(uid);
+      voiceRooms.forEach((room,chId)=>{if(room.has(uid)){room.delete(uid);const sv=db.prepare('SELECT server_id FROM channels WHERE id=?').get(chId);broadcast(sv?.server_id,{type:'VOICE_LEAVE',channelId:chId,userId:uid});broadcast(sv?.server_id,{type:'VOICE_ROOM_UPDATE',channelId:chId,participants:getVCP(chId)});}});
+      db.prepare('UPDATE users SET status=? WHERE id=?').run('offline',uid);
+      broadcast(null,{type:'USER_STATUS',userId:uid,status:'offline'});
+    }}
   });
 });
 
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`\n🔵 Molecord running → http://localhost:${PORT}\n`));
+app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
+const PORT=process.env.PORT||3000;
+server.listen(PORT,()=>console.log(`\n🔵 Molecord v2 → http://localhost:${PORT}\n`));
