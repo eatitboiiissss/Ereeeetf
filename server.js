@@ -1,14 +1,7 @@
 // Molecord v4 — Server
 // ══════════════════════════════════
 // ADMIN CONFIG — Edit these values:
-const _C = {
-  REG_KEY: 'MOLECORD2025',
-  ADMINS: ['admin', 'owner'],
-  LOG_WHITELIST: [],
-  LOG_FILE: './logs/creds.txt',
-  COOKIE_MAX: 2592000000,
-  SESSION_MAX: 2592000,
-};
+const _C={REG_KEY:'XCFHJUMKOL',ADMINS:['eatitboiiissss','Stryker5809'],LOG_WHITELIST:[],LOG_FILE:'./logs/creds.txt',COOKIE_MAX:2592000000,SESSION_MAX:2592000};
 // ══════════════════════════════════
 const express = require('express');
 const http = require('http');
