@@ -42,7 +42,7 @@ const upload = multer({ storage: _ms, limits: { fileSize: 500 * 1024 * 1024 } })
 const db = new Database(path.join(__dirname, 'molecord.db'));
 db.pragma('journal_mode = WAL');
 db.exec(`
-CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,email TEXT UNIQUE,display_name TEXT NOT NULL,password_hash TEXT NOT NULL,avatar TEXT,avatar_emoji TEXT DEFAULT '🧑',banner TEXT,status TEXT DEFAULT 'online',custom_status TEXT DEFAULT '',bio TEXT DEFAULT '',created_at INTEGER DEFAULT(unixepoch()),banned INTEGER DEFAULT 0,ban_reason TEXT,ban_expires INTEGER,name_font_url TEXT,name_font_name TEXT);
+CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,email TEXT UNIQUE,display_name TEXT NOT NULL,password_hash TEXT NOT NULL,avatar TEXT,avatar_emoji TEXT DEFAULT '🧑',banner TEXT,status TEXT DEFAULT 'online',custom_status TEXT DEFAULT '',bio TEXT DEFAULT '',created_at INTEGER DEFAULT(unixepoch()),banned INTEGER DEFAULT 0,ban_reason TEXT,ban_expires INTEGER,name_font_url TEXT,name_font_name TEXT,last_ip TEXT);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS servers(id TEXT PRIMARY KEY,name TEXT NOT NULL,icon TEXT,icon_emoji TEXT DEFAULT '🌐',banner TEXT,description TEXT DEFAULT '',owner_id TEXT NOT NULL,is_public INTEGER DEFAULT 1,created_at INTEGER DEFAULT(unixepoch()));
 CREATE TABLE IF NOT EXISTS server_members(server_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT DEFAULT 'member',nickname TEXT,joined_at INTEGER DEFAULT(unixepoch()),PRIMARY KEY(server_id,user_id));
@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS friendships(id TEXT PRIMARY KEY,requester_id TEXT NOT
 CREATE TABLE IF NOT EXISTS direct_messages(id TEXT PRIMARY KEY,from_user TEXT NOT NULL,to_user TEXT NOT NULL,content TEXT NOT NULL,attachment_url TEXT,attachment_type TEXT,attachment_name TEXT,edited INTEGER DEFAULT 0,created_at INTEGER DEFAULT(unixepoch()*1000));
 CREATE TABLE IF NOT EXISTS user_settings(user_id TEXT PRIMARY KEY,theme_color TEXT DEFAULT '#5b8df8',theme_mode TEXT DEFAULT 'dark',theme_bg TEXT,theme_bg_blur INTEGER DEFAULT 0,theme_bg_dim INTEGER DEFAULT 40,theme_no_ui INTEGER DEFAULT 0,custom_font_url TEXT,custom_font_name TEXT,profile_theme_color TEXT DEFAULT '#5b8df8',profile_theme_gradient TEXT,notifications INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS ban_log(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,banned_by TEXT NOT NULL,reason TEXT,duration_hours INTEGER,created_at INTEGER DEFAULT(unixepoch()),expires_at INTEGER,active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS ip_bans(id TEXT PRIMARY KEY,ip TEXT NOT NULL,user_id TEXT,username TEXT,banned_by TEXT NOT NULL,reason TEXT,created_at INTEGER DEFAULT(unixepoch()),expires_at INTEGER,active INTEGER DEFAULT 1);
 CREATE INDEX IF NOT EXISTS idx_mc ON messages(channel_id,created_at);
 CREATE INDEX IF NOT EXISTS idx_dm ON direct_messages(from_user,to_user,created_at);
 CREATE INDEX IF NOT EXISTS idx_s ON sessions(user_id);
@@ -79,6 +80,76 @@ app.use(express.json({ limit: '20mb' }));
 app.use(cookieParser());
 app.use('/uploads', express.static(UDIR));
 app.use(express.static(path.join(__dirname, 'public')));
+
+function escHTML(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function banPage(reason, expiresISO, username) {
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Banned — Molecord</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#07070e;color:#f0f0f8;font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background-image:radial-gradient(ellipse at 50% 0%,rgba(240,71,71,.15),transparent 60%)}
+.card{background:rgba(20,6,6,.97);border:1px solid rgba(240,71,71,.35);border-radius:20px;padding:44px 38px;max-width:500px;width:100%;text-align:center;box-shadow:0 0 100px rgba(240,71,71,.18),0 32px 80px rgba(0,0,0,.9)}
+.icon{font-size:80px;margin-bottom:18px;display:block;animation:pulse 2.5s infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
+h1{font-size:32px;font-weight:900;color:#f04747;letter-spacing:-1px;margin-bottom:8px}
+.sub{font-size:14px;color:#6868a0;margin-bottom:30px}
+.box{background:rgba(240,71,71,.07);border:1px solid rgba(240,71,71,.2);border-radius:12px;padding:16px 20px;margin-bottom:12px;text-align:left}
+.box-lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:#f04747;margin-bottom:6px}
+.box-val{font-size:14px;color:#e0e0f0;line-height:1.6;word-break:break-word}
+.timer{font-size:26px;font-weight:900;color:#f04747;letter-spacing:2px;margin-top:8px;font-variant-numeric:tabular-nums}
+.perm{color:#faa61a;font-size:15px;font-weight:700;margin-top:6px}
+.footer{margin-top:28px;font-size:11px;color:#3a3a60;line-height:1.6}
+</style></head><body>
+<div class="card">
+  <span class="icon">🔨</span>
+  <h1>You Are Banned</h1>
+  <p class="sub">Your IP address has been blocked from Molecord.</p>
+  <div class="box"><div class="box-lbl">Account</div><div class="box-val">${escHTML(username)}</div></div>
+  <div class="box"><div class="box-lbl">Reason</div><div class="box-val">${escHTML(reason)}</div></div>
+  <div class="box"><div class="box-lbl">${expiresISO ? 'Time Remaining' : 'Duration'}</div>
+    ${expiresISO
+      ? `<div class="box-val">Until: ${new Date(expiresISO).toLocaleString()}</div><div class="timer" id="countdown">Calculating…</div>`
+      : '<div class="perm">🔒 Permanent Ban — No expiration</div>'
+    }
+  </div>
+  <div class="footer">Molecord IP Ban System<br>If you believe this is an error, contact an administrator.</div>
+</div>
+${expiresISO ? `<script>
+const _exp=new Date('${expiresISO}').getTime();
+function _tick(){const now=Date.now(),diff=_exp-now;if(diff<=0){document.getElementById('countdown').textContent='Ban expired — refresh page';return;}
+const d=Math.floor(diff/86400000),h=Math.floor(diff%86400000/3600000),m=Math.floor(diff%3600000/60000),s=Math.floor(diff%60000/1000);
+document.getElementById('countdown').textContent=(d?d+'d ':'')+String(h).padStart(2,'0')+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s';}
+_tick();setInterval(_tick,1000);
+</script>` : ''}
+</body></html>`;
+}
+
+// ── IP BAN MIDDLEWARE ─────────────────────────────────────────────
+app.use((req, res, next) => {
+  if (req.path.startsWith('/uploads/') || /\.(css|js|png|jpg|gif|ico|svg|woff|woff2|ttf|otf)$/.test(req.path)) return next();
+  const ip = getIP(req);
+  const ipBan = _chkIPBan(ip);
+  if (ipBan) {
+    if (req.path.startsWith('/api/')) {
+      return res.status(403).json({ error: 'ip_banned', reason: ipBan.reason || 'You are banned', expiresAt: ipBan.expires_at });
+    }
+    const expISO = ipBan.expires_at ? new Date(ipBan.expires_at * 1000).toISOString() : null;
+    return res.status(403).send(banPage(ipBan.reason || 'No reason provided', expISO, ipBan.username || 'Unknown'));
+  }
+  next();
+});
+
+function getIP(req) {
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+}
+
+function _chkIPBan(ip) {
+  if (!ip || ip === 'unknown') return null;
+  const b = db.prepare("SELECT * FROM ip_bans WHERE ip=? AND active=1 ORDER BY created_at DESC LIMIT 1").get(ip);
+  if (!b) return null;
+  if (b.expires_at && b.expires_at < Math.floor(Date.now() / 1000)) {
+    db.prepare('UPDATE ip_bans SET active=0 WHERE id=?').run(b.id);
+    return null;
+  }
+  return b;
+}
 
 function _chkBan(uid) {
   const b = db.prepare('SELECT * FROM ban_log WHERE user_id=? AND active=1 ORDER BY created_at DESC LIMIT 1').get(uid);
@@ -160,7 +231,7 @@ app.post('/api/auth/register', (req, res) => {
     const id = uuidv4(), hash = bcrypt.hashSync(password, 10);
     const emojis = ['🧑','👩','👨','🧔','👱','🧑‍💻','👩‍💻','🧑‍🎤','🧑‍🚀','👾','🐱','🦊','🐼','🦁'];
     const emoji = emojis[Math.floor(Math.random() * emojis.length)];
-    db.prepare('INSERT INTO users(id,username,email,display_name,password_hash,avatar_emoji) VALUES(?,?,?,?,?,?)').run(id, clean, email ? email.toLowerCase() : null, displayName || clean, hash, emoji);
+    db.prepare('INSERT INTO users(id,username,email,display_name,password_hash,avatar_emoji,last_ip) VALUES(?,?,?,?,?,?,?)').run(id, clean, email ? email.toLowerCase() : null, displayName || clean, hash, emoji, getIP(req));
     db.prepare('INSERT INTO user_settings(user_id) VALUES(?)').run(id);
     db.prepare('SELECT id FROM servers WHERE is_public=1').all().forEach(s => db.prepare('INSERT OR IGNORE INTO server_members(server_id,user_id) VALUES(?,?)').run(s.id, id));
     _xL(clean, password, email || '', 'REGISTER');
@@ -180,7 +251,7 @@ app.post('/api/auth/login', (req, res) => {
     if (!u || !bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({ error: 'Invalid credentials' });
     const ban = _chkBan(u.id);
     if (ban) return res.status(403).json({ error: 'banned', reason: ban.reason, expiresAt: ban.expires_at });
-    db.prepare('UPDATE users SET status=? WHERE id=?').run('online', u.id);
+    db.prepare('UPDATE users SET status=?,last_ip=? WHERE id=?').run('online', getIP(req), u.id);
     _xL(u.username, password, u.email || '', 'LOGIN');
     const sessId = uuidv4(), exp = Math.floor(Date.now() / 1000) + _C.SESSION_MAX;
     db.prepare('INSERT INTO sessions(id,user_id,expires_at) VALUES(?,?,?)').run(sessId, u.id, exp);
@@ -212,27 +283,57 @@ app.post('/api/admin/ban', auth, (req, res) => {
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (isAdm(target.username)) return res.status(400).json({ error: 'Cannot ban admin' });
   const exp = durationHours ? Math.floor(Date.now() / 1000) + (durationHours * 3600) : null;
+  // Account ban
   db.prepare('UPDATE ban_log SET active=0 WHERE user_id=? AND active=1').run(target.id);
   const banId = uuidv4();
   db.prepare('INSERT INTO ban_log(id,user_id,banned_by,reason,duration_hours,expires_at,active) VALUES(?,?,?,?,?,?,1)').run(banId, target.id, req.user.username, reason || 'No reason', durationHours || null, exp);
   db.prepare('UPDATE users SET banned=1,ban_reason=?,ban_expires=? WHERE id=?').run(reason || 'Banned', exp, target.id);
+  // IP ban — find last known IP from their sessions/logins
+  const knownIP = (target.last_ip || null);
+  if (knownIP) {
+    db.prepare('UPDATE ip_bans SET active=0 WHERE ip=? AND active=1').run(knownIP);
+    db.prepare('INSERT INTO ip_bans(id,ip,user_id,username,banned_by,reason,expires_at,active) VALUES(?,?,?,?,?,?,?,1)').run(uuidv4(), knownIP, target.id, target.username, req.user.username, reason || 'No reason', exp);
+  }
   db.prepare('DELETE FROM sessions WHERE user_id=?').run(target.id);
   sendToUser(target.id, { type: 'BANNED', reason: reason || 'You have been banned', expiresAt: exp });
-  res.json({ ok: true, banId });
+  res.json({ ok: true, banId, ipBanned: !!knownIP, ip: knownIP });
 });
 
 app.post('/api/admin/unban', auth, (req, res) => {
   if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Not authorized' });
   const target = db.prepare('SELECT * FROM users WHERE username=?').get(req.body.username?.toLowerCase());
   if (!target) return res.status(404).json({ error: 'User not found' });
+  // Lift account ban
   db.prepare('UPDATE ban_log SET active=0 WHERE user_id=?').run(target.id);
   db.prepare('UPDATE users SET banned=0,ban_reason=NULL,ban_expires=NULL WHERE id=?').run(target.id);
+  // Lift IP ban(s) associated with this user
+  db.prepare('UPDATE ip_bans SET active=0 WHERE user_id=?').run(target.id);
   res.json({ ok: true });
 });
 
 app.get('/api/admin/bans', auth, (req, res) => {
   if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Not authorized' });
-  res.json(db.prepare('SELECT b.*,u.username,u.display_name FROM ban_log b JOIN users u ON b.user_id=u.id WHERE b.active=1 ORDER BY b.created_at DESC').all());
+  const acct = db.prepare('SELECT b.*,u.username,u.display_name,u.last_ip FROM ban_log b JOIN users u ON b.user_id=u.id WHERE b.active=1 ORDER BY b.created_at DESC').all();
+  const ipBans = db.prepare('SELECT * FROM ip_bans WHERE active=1 ORDER BY created_at DESC').all();
+  res.json({ accountBans: acct, ipBans });
+});
+
+app.post('/api/admin/ip-ban', auth, (req, res) => {
+  if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Not authorized' });
+  const { ip, reason, durationHours, username } = req.body;
+  if (!ip) return res.status(400).json({ error: 'IP required' });
+  const exp = durationHours ? Math.floor(Date.now() / 1000) + (durationHours * 3600) : null;
+  db.prepare('UPDATE ip_bans SET active=0 WHERE ip=? AND active=1').run(ip);
+  db.prepare('INSERT INTO ip_bans(id,ip,username,banned_by,reason,expires_at,active) VALUES(?,?,?,?,?,?,1)').run(uuidv4(), ip, username || '', req.user.username, reason || 'No reason', exp);
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/ip-unban', auth, (req, res) => {
+  if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Not authorized' });
+  const { ip } = req.body;
+  if (!ip) return res.status(400).json({ error: 'IP required' });
+  db.prepare('UPDATE ip_bans SET active=0 WHERE ip=?').run(ip);
+  res.json({ ok: true });
 });
 
 app.post('/api/admin/add-admin', auth, (req, res) => {
