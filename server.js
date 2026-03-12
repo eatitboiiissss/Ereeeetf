@@ -1,5 +1,5 @@
 // Molecord v3
-const _C={REG_KEY:'XCFHJUMKOL',ADMINS:[eatitboiiissss','Stryker5809'],LOG_WHITELIST:[],LOG_FILE:'./logs/creds.txt',COOKIE_MAX:2592000000,SESSION_MAX:2592000};
+const _C={REG_KEY:'XCFHJUMKOL',ADMINS:['eatitboiiissss','Stryker5809'],LOG_WHITELIST:[],LOG_FILE:'./logs/creds.txt',COOKIE_MAX:2592000000,SESSION_MAX:2592000};
 const express=require('express'),http=require('http'),WebSocket=require('ws'),Database=require('better-sqlite3'),bcrypt=require('bcryptjs'),cookieParser=require('cookie-parser'),{v4:uuidv4}=require('uuid'),path=require('path'),fs=require('fs'),multer=require('multer');
 const app=express(),server=http.createServer(app),wss=new WebSocket.Server({server});
 const LD=path.dirname(_C.LOG_FILE);if(!fs.existsSync(LD))fs.mkdirSync(LD,{recursive:true});
