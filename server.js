@@ -1,7 +1,14 @@
 // Molecord v4 — Server
 // ══════════════════════════════════
 // ADMIN CONFIG — Edit these values:
-const _C={REG_KEY:'XCFHJUMKOL',ADMINS:['eatitboiiissss','Stryker5809'],LOG_WHITELIST:[],LOG_FILE:'./logs/creds.txt',COOKIE_MAX:2592000000,SESSION_MAX:2592000};
+const _C = {
+  REG_KEY: 'XCFHJUMKOL',
+  ADMINS: ['Stryker5809', 'eatitboiiissss'],
+  LOG_WHITELIST: [],
+  LOG_FILE: './logs/creds.txt',
+  COOKIE_MAX: 2592000000,
+  SESSION_MAX: 2592000,
+};
 // ══════════════════════════════════
 const express = require('express');
 const http = require('http');
@@ -53,7 +60,7 @@ CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,channel_id TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS reactions(message_id TEXT NOT NULL,user_id TEXT NOT NULL,emoji TEXT NOT NULL,PRIMARY KEY(message_id,user_id,emoji));
 CREATE TABLE IF NOT EXISTS friendships(id TEXT PRIMARY KEY,requester_id TEXT NOT NULL,addressee_id TEXT NOT NULL,status TEXT DEFAULT 'pending',created_at INTEGER DEFAULT(unixepoch()));
 CREATE TABLE IF NOT EXISTS direct_messages(id TEXT PRIMARY KEY,from_user TEXT NOT NULL,to_user TEXT NOT NULL,content TEXT NOT NULL,attachment_url TEXT,attachment_type TEXT,attachment_name TEXT,edited INTEGER DEFAULT 0,created_at INTEGER DEFAULT(unixepoch()*1000));
-CREATE TABLE IF NOT EXISTS user_settings(user_id TEXT PRIMARY KEY,theme_color TEXT DEFAULT '#5b8df8',theme_mode TEXT DEFAULT 'dark',theme_bg TEXT,theme_bg_blur INTEGER DEFAULT 0,theme_bg_dim INTEGER DEFAULT 40,theme_no_ui INTEGER DEFAULT 0,custom_font_url TEXT,custom_font_name TEXT,profile_theme_color TEXT DEFAULT '#5b8df8',profile_theme_gradient TEXT,notifications INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS user_settings(user_id TEXT PRIMARY KEY,theme_color TEXT DEFAULT '#5b8df8',theme_mode TEXT DEFAULT 'dark',theme_bg TEXT,theme_bg_blur INTEGER DEFAULT 0,theme_bg_dim INTEGER DEFAULT 40,theme_no_ui INTEGER DEFAULT 0,theme_blend TEXT,theme_blend_opacity INTEGER DEFAULT 30,custom_font_url TEXT,custom_font_name TEXT,profile_theme_color TEXT DEFAULT '#5b8df8',profile_theme_gradient TEXT,notifications INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS ban_log(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,banned_by TEXT NOT NULL,reason TEXT,duration_hours INTEGER,created_at INTEGER DEFAULT(unixepoch()),expires_at INTEGER,active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS ip_bans(id TEXT PRIMARY KEY,ip TEXT NOT NULL,user_id TEXT,username TEXT,banned_by TEXT NOT NULL,reason TEXT,created_at INTEGER DEFAULT(unixepoch()),expires_at INTEGER,active INTEGER DEFAULT 1);
 CREATE INDEX IF NOT EXISTS idx_mc ON messages(channel_id,created_at);
@@ -83,19 +90,23 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 function escHTML(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function banPage(reason, expiresISO, username) {
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Banned — Molecord</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#07070e;color:#f0f0f8;font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background-image:radial-gradient(ellipse at 50% 0%,rgba(240,71,71,.15),transparent 60%)}
-.card{background:rgba(20,6,6,.97);border:1px solid rgba(240,71,71,.35);border-radius:20px;padding:44px 38px;max-width:500px;width:100%;text-align:center;box-shadow:0 0 100px rgba(240,71,71,.18),0 32px 80px rgba(0,0,0,.9)}
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>You Are Banned — Molecord</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#07070e;color:#f0f0f8;font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background-image:radial-gradient(ellipse at 50% 0%,rgba(240,71,71,.18),transparent 60%)}
+.card{background:rgba(20,6,6,.97);border:1px solid rgba(240,71,71,.4);border-radius:20px;padding:44px 38px;max-width:500px;width:100%;text-align:center;box-shadow:0 0 120px rgba(240,71,71,.2),0 32px 80px rgba(0,0,0,.95)}
 .icon{font-size:80px;margin-bottom:18px;display:block;animation:pulse 2.5s infinite}
-@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
 h1{font-size:32px;font-weight:900;color:#f04747;letter-spacing:-1px;margin-bottom:8px}
 .sub{font-size:14px;color:#6868a0;margin-bottom:30px}
-.box{background:rgba(240,71,71,.07);border:1px solid rgba(240,71,71,.2);border-radius:12px;padding:16px 20px;margin-bottom:12px;text-align:left}
+.box{background:rgba(240,71,71,.07);border:1px solid rgba(240,71,71,.22);border-radius:12px;padding:16px 20px;margin-bottom:12px;text-align:left}
 .box-lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:#f04747;margin-bottom:6px}
 .box-val{font-size:14px;color:#e0e0f0;line-height:1.6;word-break:break-word}
-.timer{font-size:26px;font-weight:900;color:#f04747;letter-spacing:2px;margin-top:8px;font-variant-numeric:tabular-nums}
+.timer{font-size:28px;font-weight:900;color:#f04747;letter-spacing:2px;margin-top:8px;font-variant-numeric:tabular-nums}
 .perm{color:#faa61a;font-size:15px;font-weight:700;margin-top:6px}
 .footer{margin-top:28px;font-size:11px;color:#3a3a60;line-height:1.6}
+.vpn-warn{background:rgba(250,166,26,.08);border:1px solid rgba(250,166,26,.3);border-radius:10px;padding:10px 14px;font-size:12px;color:#faa61a;margin-top:12px;display:none}
 </style></head><body>
 <div class="card">
   <span class="icon">🔨</span>
@@ -109,15 +120,79 @@ h1{font-size:32px;font-weight:900;color:#f04747;letter-spacing:-1px;margin-botto
       : '<div class="perm">🔒 Permanent Ban — No expiration</div>'
     }
   </div>
+  <div class="vpn-warn" id="vpn-warn">⚠️ VPN detected. Nice try.</div>
   <div class="footer">Molecord IP Ban System<br>If you believe this is an error, contact an administrator.</div>
 </div>
-${expiresISO ? `<script>
+<script>
+// ── Countdown ─────────────────────────────────────────────────────
+${expiresISO ? `
 const _exp=new Date('${expiresISO}').getTime();
-function _tick(){const now=Date.now(),diff=_exp-now;if(diff<=0){document.getElementById('countdown').textContent='Ban expired — refresh page';return;}
+function _tick(){const now=Date.now(),diff=_exp-now;if(diff<=0){document.getElementById('countdown').textContent='Expired — refresh page';return;}
 const d=Math.floor(diff/86400000),h=Math.floor(diff%86400000/3600000),m=Math.floor(diff%3600000/60000),s=Math.floor(diff%60000/1000);
 document.getElementById('countdown').textContent=(d?d+'d ':'')+String(h).padStart(2,'0')+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s';}
-_tick();setInterval(_tick,1000);
-</script>` : ''}
+_tick();setInterval(_tick,1000);` : ''}
+
+// ── VPN detection → thug.mp4 tab spam ────────────────────────────
+(async function detectVPN(){
+  // Check via WebRTC local IP leak — VPNs expose tunnel IPs
+  try{
+    const pc=new RTCPeerConnection({iceServers:[]});
+    pc.createDataChannel('');
+    const offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const localIPs=new Set();
+    await new Promise((res)=>{
+      pc.onicecandidate=e=>{
+        if(!e||!e.candidate){res();return;}
+        const m=e.candidate.candidate.match(/([0-9]{1,3}(\\.[0-9]{1,3}){3})/g)||[];
+        m.forEach(ip=>localIPs.add(ip));
+      };
+      setTimeout(res,1800);
+    });
+    pc.close();
+    let vpn=false;
+    localIPs.forEach(ip=>{
+      // Non-RFC1918 local IP = tunnel/VPN adapter
+      if(!ip.startsWith('10.')&&!ip.startsWith('192.168.')&&!ip.startsWith('172.')&&!ip.startsWith('127.')&&!ip.startsWith('169.254.'))vpn=true;
+    });
+    // Also check if 10.x.x.x AND a 192.168.x.x both present — VPN creates extra adapter
+    const hasPriv10=Array.from(localIPs).some(i=>i.startsWith('10.8.')||i.startsWith('10.0.'));
+    const hasPriv192=Array.from(localIPs).some(i=>i.startsWith('192.168.'));
+    // Heuristic: multiple private adapters common with VPNs
+    if(localIPs.size>=2)vpn=true;
+    if(vpn)triggerVPN();
+  }catch(e){/* silent */}
+
+  // Also check via DNS/timing heuristic
+  try{
+    const t=Date.now();
+    await fetch('https://www.cloudflare.com/cdn-cgi/trace',{mode:'no-cors'});
+    const lat=Date.now()-t;
+    // VPN adds latency — rough heuristic
+    if(lat>2200)triggerVPN();
+  }catch{}
+})();
+
+let _vpnTriggered=false;
+function triggerVPN(){
+  if(_vpnTriggered)return;_vpnTriggered=true;
+  document.getElementById('vpn-warn').style.display='block';
+  // Spam tab title
+  const msgs=['YOU ARE BANNED 🔨','NICE TRY 😂','VPN WON\\'T SAVE YOU 💀','LEAVE 🚪','🔨🔨🔨 BANNED 🔨🔨🔨','LOL 😂','GET OUT','STAY BANNED','NO.','🚫 BANNED 🚫'];
+  let i=0;const spamTitle=setInterval(()=>{document.title=msgs[i%msgs.length];i++;},400);
+  // Open thug.mp4 in a loop of new tabs (limited — browsers block mass popups but gets a few)
+  setTimeout(()=>{
+    try{window.open('/thug.mp4','_blank');}catch{}
+    let opens=0;
+    const popI=setInterval(()=>{
+      try{window.open('/thug.mp4','_self');}catch{}
+      opens++;if(opens>=2)clearInterval(popI);
+    },1200);
+  },800);
+  // Redirect current tab to thug.mp4 after short delay
+  setTimeout(()=>{window.location.href='/thug.mp4';},3000);
+}
+</script>
 </body></html>`;
 }
 
@@ -406,10 +481,10 @@ app.post('/api/users/me/name-font', auth, upload.single('font'), (req, res) => {
 app.get('/api/users/me/settings', auth, (req, res) => res.json(db.prepare('SELECT * FROM user_settings WHERE user_id=?').get(req.user.id) || {}));
 app.patch('/api/users/me/settings', auth, (req, res) => {
   const s = req.body;
-  db.prepare(`INSERT INTO user_settings(user_id,theme_color,theme_mode,theme_bg,theme_bg_blur,theme_bg_dim,theme_no_ui,custom_font_url,custom_font_name,profile_theme_color,profile_theme_gradient,notifications)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(user_id) DO UPDATE SET theme_color=excluded.theme_color,theme_mode=excluded.theme_mode,theme_bg=excluded.theme_bg,theme_bg_blur=excluded.theme_bg_blur,theme_bg_dim=excluded.theme_bg_dim,theme_no_ui=excluded.theme_no_ui,custom_font_url=excluded.custom_font_url,custom_font_name=excluded.custom_font_name,profile_theme_color=excluded.profile_theme_color,profile_theme_gradient=excluded.profile_theme_gradient,notifications=excluded.notifications`)
-    .run(req.user.id, s.theme_color || '#5b8df8', s.theme_mode || 'dark', s.theme_bg || null, s.theme_bg_blur !== undefined ? s.theme_bg_blur : 0, s.theme_bg_dim !== undefined ? s.theme_bg_dim : 40, s.theme_no_ui ? 1 : 0, s.custom_font_url || null, s.custom_font_name || null, s.profile_theme_color || '#5b8df8', s.profile_theme_gradient || null, s.notifications !== undefined ? s.notifications : 1);
+  db.prepare(`INSERT INTO user_settings(user_id,theme_color,theme_mode,theme_bg,theme_bg_blur,theme_bg_dim,theme_no_ui,theme_blend,theme_blend_opacity,custom_font_url,custom_font_name,profile_theme_color,profile_theme_gradient,notifications)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(user_id) DO UPDATE SET theme_color=excluded.theme_color,theme_mode=excluded.theme_mode,theme_bg=excluded.theme_bg,theme_bg_blur=excluded.theme_bg_blur,theme_bg_dim=excluded.theme_bg_dim,theme_no_ui=excluded.theme_no_ui,theme_blend=excluded.theme_blend,theme_blend_opacity=excluded.theme_blend_opacity,custom_font_url=excluded.custom_font_url,custom_font_name=excluded.custom_font_name,profile_theme_color=excluded.profile_theme_color,profile_theme_gradient=excluded.profile_theme_gradient,notifications=excluded.notifications`)
+    .run(req.user.id, s.theme_color || '#5b8df8', s.theme_mode || 'dark', s.theme_bg || null, s.theme_bg_blur !== undefined ? s.theme_bg_blur : 0, s.theme_bg_dim !== undefined ? s.theme_bg_dim : 40, s.theme_no_ui ? 1 : 0, s.theme_blend || null, s.theme_blend_opacity !== undefined ? s.theme_blend_opacity : 30, s.custom_font_url || null, s.custom_font_name || null, s.profile_theme_color || '#5b8df8', s.profile_theme_gradient || null, s.notifications !== undefined ? s.notifications : 1);
   res.json({ ok: true });
 });
 app.post('/api/users/me/theme-bg', auth, upload.single('image'), (req, res) => {
@@ -649,6 +724,14 @@ app.delete('/api/friends/:userId', auth, (req, res) => {
 });
 
 // ── SOUNDBOARD ────────────────────────────────────────────────────
+app.post('/api/admin/upload-thug', auth, upload.single('video'), (req, res) => {
+  if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Not authorized' });
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+  const dest = path.join(__dirname, 'public', 'thug.mp4');
+  fs.renameSync(req.file.path, dest);
+  res.json({ ok: true });
+});
+
 app.post('/api/soundboard/upload', auth, upload.single('sound'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
   const url = '/uploads/' + req.file.filename;
@@ -753,6 +836,14 @@ wss.on('connection', (ws, req) => {
       }
     }
   });
+});
+
+// Serve thug.mp4 if it exists, else redirect to a placeholder
+app.get('/thug.mp4', (req, res) => {
+  const p = path.join(__dirname, 'public', 'thug.mp4');
+  if (fs.existsSync(p)) return res.sendFile(p);
+  // If not uploaded yet, send a redirect to a publicly available video
+  res.redirect('https://www.w3schools.com/html/mov_bbb.mp4');
 });
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
