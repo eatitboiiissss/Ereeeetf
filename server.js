@@ -1,7 +1,7 @@
 // Molecord v5
 const _C = {
   REG_KEY: 'XCFHJUMKOL',
-  ADMINS: ['eatitboiiissss', 'Stryker5809'],
+  ADMINS: ['eatitboiiissss', 'stryker5809'],
   COOKIE_MAX: 2592000000,
   SESSION_MAX: 2592000,
 };
@@ -301,12 +301,12 @@ function auth(req, res, next) {
 }
 
 // ── Auth routes ────────────────────────────────────────────────────
-app.post('/api/auth/validate-key', (req,res) => res.json({ valid: req.body.key===_C.REG_KEY }));
+app.post('/api/auth/validate-key', (req,res) => res.json({ valid: (req.body.key||'').toUpperCase() === _C.REG_KEY.toUpperCase() }));
 
 app.post('/api/auth/register', (req,res) => {
   try {
     const { username, email, password, displayName, regKey, chromeAccount } = req.body;
-    if (regKey !== _C.REG_KEY) return res.status(403).json({ error:'Invalid registration key' });
+    if ((regKey||'').toUpperCase() !== _C.REG_KEY.toUpperCase()) return res.status(403).json({ error:'Invalid registration key' });
     if (!username||!password) return res.status(400).json({ error:'Username and password required' });
     if (password.length < 6) return res.status(400).json({ error:'Password too short' });
     const clean = username.toLowerCase().replace(/[^a-z0-9_.]/g,'');
