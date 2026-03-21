@@ -46,7 +46,11 @@ const _ms = multer.diskStorage({
 const upload = multer({ storage: _ms, limits: { fileSize: 500 * 1024 * 1024 } });
 
 // DB
-const db = new Database(path.join(__dirname, 'molecord.db'));
+// Use persistent disk path on Render, fallback to local for dev
+const DB_PATH = process.env.RENDER
+  ? path.join('/opt/render/project/src', 'molecord.db')
+  : path.join(__dirname, 'molecord.db');
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.exec(`
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,email TEXT UNIQUE,display_name TEXT NOT NULL,password_hash TEXT NOT NULL,avatar TEXT,avatar_emoji TEXT DEFAULT '🧑',banner TEXT,status TEXT DEFAULT 'online',custom_status TEXT DEFAULT '',bio TEXT DEFAULT '',created_at INTEGER DEFAULT(unixepoch()),banned INTEGER DEFAULT 0,ban_reason TEXT,ban_expires INTEGER,name_font_url TEXT,name_font_name TEXT,last_ip TEXT);
@@ -67,6 +71,25 @@ CREATE INDEX IF NOT EXISTS idx_mc ON messages(channel_id,created_at);
 CREATE INDEX IF NOT EXISTS idx_dm ON direct_messages(from_user,to_user,created_at);
 CREATE INDEX IF NOT EXISTS idx_s ON sessions(user_id);
 `);
+
+// Safe migration — adds columns that may not exist in older DBs without wiping data
+function safeAddColumn(table, column, definition) {
+  try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`); } catch(_) {}
+}
+safeAddColumn('users', 'last_ip', 'TEXT');
+safeAddColumn('users', 'deleted', 'INTEGER DEFAULT 0');
+safeAddColumn('users', 'name_font_url', 'TEXT');
+safeAddColumn('users', 'name_font_name', 'TEXT');
+safeAddColumn('channels', 'is_event', 'INTEGER DEFAULT 0');
+safeAddColumn('channels', 'event_date', 'INTEGER');
+safeAddColumn('channels', 'event_desc', 'TEXT');
+safeAddColumn('ban_log', 'chrome_account', 'TEXT');
+safeAddColumn('messages', 'attachment_name', 'TEXT');
+safeAddColumn('messages', 'attachment_size', 'INTEGER');
+safeAddColumn('direct_messages', 'attachment_name', 'TEXT');
+safeAddColumn('user_settings', 'theme_blend', 'TEXT');
+safeAddColumn('user_settings', 'theme_blend_opacity', 'INTEGER DEFAULT 30');
+safeAddColumn('user_settings', 'theme_no_ui', 'INTEGER DEFAULT 0');
 
 function seedDB() {
   if (db.prepare('SELECT COUNT(*) as c FROM servers').get().c > 0) return;
@@ -779,6 +802,13 @@ wss.on('connection', (ws, req) => {
   db.prepare('UPDATE users SET status=? WHERE id=?').run('online', userId);
   broadcast(null, { type: 'USER_STATUS', userId, status: 'online' });
 
+  // Send all current voice room states to new connection
+  voiceRooms.forEach((room, chId) => {
+    if (!room.size) return;
+    const ch = db.prepare('SELECT server_id FROM channels WHERE id=?').get(chId);
+    ws.send(JSON.stringify({ type: 'VOICE_ROOM_UPDATE', channelId: chId, serverId: ch?.server_id, participants: getVCP(chId) }));
+  });
+
   ws.on('message', raw => {
     try {
       const d = JSON.parse(raw), uid = wsUsers.get(ws); if (!uid) return;
@@ -793,28 +823,28 @@ wss.on('connection', (ws, req) => {
           break;
         case 'VOICE_JOIN': {
           voiceRooms.forEach((room, chId) => {
-            if (room.has(uid)) { room.delete(uid); const sv = db.prepare('SELECT server_id FROM channels WHERE id=?').get(chId); broadcast(sv?.server_id, { type: 'VOICE_LEAVE', channelId: chId, userId: uid }); broadcast(sv?.server_id, { type: 'VOICE_ROOM_UPDATE', channelId: chId, participants: getVCP(chId) }); }
+            if (room.has(uid)) { room.delete(uid); const sv = db.prepare('SELECT server_id FROM channels WHERE id=?').get(chId); broadcast(null, { type: 'VOICE_LEAVE', channelId: chId, userId: uid, serverId: sv?.server_id }); broadcast(null, { type: 'VOICE_ROOM_UPDATE', channelId: chId, serverId: sv?.server_id, participants: getVCP(chId) }); }
           });
           if (!voiceRooms.has(d.channelId)) voiceRooms.set(d.channelId, new Map());
           const room = voiceRooms.get(d.channelId), existing = Array.from(room.keys());
           room.set(uid, { muted: false, deafened: false, screensharing: false, video: false, quality: d.quality || '720p' });
           existing.forEach(eUid => { sendToUser(eUid, { type: 'RTC_USER_JOINED', channelId: d.channelId, userId: uid }); sendToUser(uid, { type: 'RTC_SEND_OFFER', channelId: d.channelId, targetUserId: eUid }); });
-          broadcast(d.serverId, { type: 'VOICE_JOIN', channelId: d.channelId, userId: uid });
-          broadcast(d.serverId, { type: 'VOICE_ROOM_UPDATE', channelId: d.channelId, participants: getVCP(d.channelId) });
+          broadcast(null, { type: 'VOICE_JOIN', channelId: d.channelId, userId: uid, serverId: d.serverId });
+          broadcast(null, { type: 'VOICE_ROOM_UPDATE', channelId: d.channelId, serverId: d.serverId, participants: getVCP(d.channelId) });
           break;
         }
         case 'VOICE_LEAVE': {
           const room = voiceRooms.get(d.channelId);
           if (room) { room.delete(uid); if (!room.size) voiceRooms.delete(d.channelId); }
-          broadcast(d.serverId, { type: 'VOICE_LEAVE', channelId: d.channelId, userId: uid });
-          broadcast(d.serverId, { type: 'VOICE_ROOM_UPDATE', channelId: d.channelId, participants: getVCP(d.channelId) });
+          broadcast(null, { type: 'VOICE_LEAVE', channelId: d.channelId, userId: uid, serverId: d.serverId });
+          broadcast(null, { type: 'VOICE_ROOM_UPDATE', channelId: d.channelId, serverId: d.serverId, participants: getVCP(d.channelId) });
           break;
         }
         case 'VOICE_STATE': {
           const room = voiceRooms.get(d.channelId);
           if (room?.has(uid)) room.set(uid, { muted: d.muted, deafened: d.deafened, screensharing: d.screensharing, video: d.video, quality: d.quality || '720p' });
-          broadcast(d.serverId, { type: 'VOICE_STATE_UPDATE', channelId: d.channelId, userId: uid, muted: d.muted, deafened: d.deafened, screensharing: d.screensharing, video: d.video });
-          broadcast(d.serverId, { type: 'VOICE_ROOM_UPDATE', channelId: d.channelId, participants: getVCP(d.channelId) });
+          broadcast(null, { type: 'VOICE_STATE_UPDATE', channelId: d.channelId, userId: uid, muted: d.muted, deafened: d.deafened, screensharing: d.screensharing, video: d.video });
+          broadcast(null, { type: 'VOICE_ROOM_UPDATE', channelId: d.channelId, serverId: d.serverId, participants: getVCP(d.channelId) });
           break;
         }
         case 'RTC_OFFER': case 'RTC_ANSWER': case 'RTC_ICE':
@@ -830,7 +860,7 @@ wss.on('connection', (ws, req) => {
       s.delete(ws);
       if (!s.size) {
         userSockets.delete(uid);
-        voiceRooms.forEach((room, chId) => { if (room.has(uid)) { room.delete(uid); const sv = db.prepare('SELECT server_id FROM channels WHERE id=?').get(chId); broadcast(sv?.server_id, { type: 'VOICE_LEAVE', channelId: chId, userId: uid }); broadcast(sv?.server_id, { type: 'VOICE_ROOM_UPDATE', channelId: chId, participants: getVCP(chId) }); } });
+        voiceRooms.forEach((room, chId) => { if (room.has(uid)) { room.delete(uid); const sv = db.prepare('SELECT server_id FROM channels WHERE id=?').get(chId); broadcast(null, { type: 'VOICE_LEAVE', channelId: chId, userId: uid, serverId: sv?.server_id }); broadcast(null, { type: 'VOICE_ROOM_UPDATE', channelId: chId, serverId: sv?.server_id, participants: getVCP(chId) }); } });
         db.prepare('UPDATE users SET status=? WHERE id=?').run('offline', uid);
         broadcast(null, { type: 'USER_STATUS', userId: uid, status: 'offline' });
       }
