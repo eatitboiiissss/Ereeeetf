@@ -1,7 +1,7 @@
 // Molecord v5
 const _C = {
   REG_KEY: 'XCFHJUMKOL',
-  ADMINS: ['eatitboiiissss', 'Stryker5809'],
+  ADMINS: ['eatitboiiissss', Stryker5809'],
   COOKIE_MAX: 2592000000,
   SESSION_MAX: 2592000,
 };
