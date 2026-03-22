@@ -99,308 +99,27 @@ safeAddColumn('user_settings', 'theme_blend', 'TEXT');
 safeAddColumn('user_settings', 'theme_blend_opacity', 'INTEGER DEFAULT 30');
 safeAddColumn('user_settings', 'theme_no_ui', 'INTEGER DEFAULT 0');
 
-// ══════════════════════════════════════════════════════════════
-// MOLECORD SHIELD — Advanced DDoS + Intrusion Detection System
-// ══════════════════════════════════════════════════════════════
-
-const _shield = {
-  // Per-IP request counters: ip -> { count, window_start, strikes, blocked_until, req_sizes, paths, ua_set, last_req }
-  ips: new Map(),
-  // Global request counter for flood detection
-  globalRps: 0,
-  globalRpsWindow: Date.now(),
-  globalBlocked: false,
-  // Suspicious path patterns (scanners, exploit attempts)
-  badPaths: [
-    /\/\.env/i, /\/\.git/i, /\/wp-admin/i, /\/wp-login/i, /\/phpmyadmin/i,
-    /\/admin\.php/i, /\/shell\.php/i, /\/cmd\.php/i, /\/eval/i,
-    /\/etc\/passwd/i, /\/proc\/self/i, /\/xmlrpc/i, /\/cgi-bin/i,
-    /\/boaform/i, /\/setup\.cgi/i, /\/manager\/html/i, /\/solr\//i,
-    /select.*from/i, /union.*select/i, /drop.*table/i, /insert.*into/i,
-    /<script/i, /javascript:/i, /onerror=/i, /onload=/i,
-    /\.\.\//,  // path traversal
-    /\/backup/i, /\/config/i, /\/database/i, /\/dump/i,
-  ],
-  // Bad user agents (bots, scanners, exploit tools)
-  badUAs: [
-    'masscan', 'zgrab', 'nmap', 'nikto', 'sqlmap', 'dirbuster',
-    'hydra', 'medusa', 'metasploit', 'nuclei', 'gobuster', 'ffuf',
-    'wfuzz', 'burpsuite', 'havij', 'acunetix', 'nessus', 'openvas',
-    'python-requests', 'go-http-client', 'curl/', 'libwww-perl',
-    'scrapy', 'wget/', 'java/', 'axios/', 'node-fetch',
-    'bot', 'crawler', 'spider', 'scanner',
-  ],
-  // Thresholds
-  LIMITS: {
-    req_per_sec: 25,          // max requests/second per IP
-    req_per_min: 300,         // max requests/minute per IP
-    auth_per_min: 8,          // max auth attempts/minute
-    global_rps: 500,          // global requests/second before flood mode
-    max_body: 20 * 1024 * 1024, // 20MB max body
-    max_url_len: 2048,        // max URL length
-    strikes_before_ban: 5,    // suspicious events before temp ban
-    temp_ban_ms: 15 * 60000,  // 15 min temp ban
-    hard_ban_strikes: 15,     // strikes before permanent ban
-  },
-  // Alert owners about attacks
-  alerts: [],
-};
-
-// Cloudflare IP ranges — these are CF proxy IPs, never rate-limit them
-// Real client IP comes via CF-Connecting-IP header when behind Cloudflare
-const CF_RANGES = [
-  '173.245.48.', '103.21.244.', '103.22.200.', '103.31.4.',
-  '141.101.64.', '108.162.192.', '190.93.240.', '188.114.96.',
-  '197.234.240.', '198.41.128.', '162.158.', '104.16.',
-  '104.17.', '104.18.', '104.19.', '104.20.', '104.21.',
-  '104.22.', '104.23.', '104.24.', '104.25.', '104.26.',
-  '104.27.', '172.64.', '172.65.', '172.66.', '172.67.',
-  '172.68.', '172.69.', '172.70.', '172.71.',
-  '131.0.72.', '2400:cb00:', '2606:4700:', '2803:f800:',
-  '2405:b500:', '2405:8100:', '2a06:98c0:', '2c0f:f248:',
-];
-function isCFIP(ip) {
-  return CF_RANGES.some(r => ip.startsWith(r));
-}
-
-// Get real client IP — CF-Connecting-IP is set by Cloudflare with the real visitor IP
-function getRealIP(req) {
-  // Cloudflare sets CF-Connecting-IP to the real visitor IP
-  const cf = req.headers['cf-connecting-ip'];
-  if (cf) return cf.trim();
-  // Fallback for direct/non-CF connections
-  const fwd = req.headers['x-forwarded-for'];
-  if (fwd) return fwd.split(',')[0].trim();
-  return req.socket.remoteAddress || 'unknown';
-}
-
-function _shieldGetIP(req) {
-  return getRealIP(req);
-}
-
-function _shieldAlert(type, ip, detail) {
-  const entry = { type, ip, detail, ts: Date.now() };
-  _shield.alerts.unshift(entry);
-  if (_shield.alerts.length > 200) _shield.alerts.length = 200;
-  logActivity('SHIELD_' + type, '', null, ip, detail);
-  // Broadcast to owners in real-time
-  try {
-    const msg = JSON.stringify({ type: 'SHIELD_ALERT', alert: entry });
-    wss.clients.forEach(ws => {
-      const uid = wsUsers.get(ws);
-      if (uid) { const u = db.prepare('SELECT username FROM users WHERE id=?').get(uid); if (u && isOwner(u.username) && ws.readyState === 1) ws.send(msg); }
-    });
-  } catch (_) {}
-}
-
-function _shieldTempBan(ip, reason) {
-  const state = _shield.ips.get(ip) || {};
-  state.blocked_until = Date.now() + _shield.LIMITS.temp_ban_ms;
-  state.block_reason = reason;
-  _shield.ips.set(ip, state);
-  _shieldAlert('TEMP_BAN', ip, reason);
-}
-
-function _shieldAddStrike(ip, reason) {
-  const state = _shield.ips.get(ip) || { count: 0, strikes: 0, req_sizes: [], paths: new Set(), ua_set: new Set() };
-  state.strikes = (state.strikes || 0) + 1;
-  _shield.ips.set(ip, state);
-  if (state.strikes >= _shield.LIMITS.hard_ban_strikes) {
-    // Auto permanent IP ban in DB
-    try {
-      db.prepare('UPDATE ip_bans SET active=0 WHERE ip=? AND active=1').run(ip);
-      db.prepare('INSERT INTO ip_bans(id,ip,username,banned_by,reason,expires_at,active) VALUES(?,?,?,?,?,?,1)').run(
-        require('crypto').randomUUID(), ip, '', 'SHIELD', 'Auto-banned: ' + reason, null
-      );
-    } catch(_) {}
-    _shieldAlert('PERM_BAN', ip, 'Auto-perm-banned after ' + state.strikes + ' strikes: ' + reason);
-  } else if (state.strikes >= _shield.LIMITS.strikes_before_ban) {
-    _shieldTempBan(ip, 'Too many strikes: ' + reason);
-  } else {
-    _shieldAlert('STRIKE', ip, `Strike ${state.strikes}: ${reason}`);
-  }
-}
-
-// ── Main shield middleware ────────────────────────────────────────
-app.use((req, res, next) => {
-  const ip = _shieldGetIP(req);
-  const rawIp = req.socket.remoteAddress || '';
-  const now = Date.now();
-  const path = req.path || '/';
-  const ua = (req.headers['user-agent'] || '').toLowerCase();
-  const method = req.method;
-
-  // If the connection comes from a Cloudflare edge node, trust CF-Connecting-IP
-  // and skip network-level checks on the CF proxy IP itself
-  const behindCF = isCFIP(rawIp) || !!req.headers['cf-connecting-ip'];
-  // Still run all checks against the real client IP (ip), not rawIp
-
-  // 1. Check if globally blocking (flood mode)
-  if (_shield.globalBlocked && now - _shield.globalRpsWindow < 10000) {
-    return res.status(503).set('Retry-After', '10').send('Service temporarily unavailable. Please wait.');
-  }
-
-  // 2. Check per-IP temp ban
-  const state = _shield.ips.get(ip);
-  if (state?.blocked_until && state.blocked_until > now) {
-    return res.status(429).set('Retry-After', Math.ceil((state.blocked_until - now) / 1000)).json({
-      error: 'Too many requests. Try again later.', retry_after: Math.ceil((state.blocked_until - now) / 1000)
-    });
-  }
-
-  // 3. Check permanent IP ban (use real client IP)
-  try {
-    const ipBan = db.prepare('SELECT * FROM ip_bans WHERE ip=? AND active=1 ORDER BY created_at DESC LIMIT 1').get(ip);
-    if (ipBan) {
-      if (path.startsWith('/api/')) return res.status(403).json({ error: 'ip_banned' });
-      const expISO = ipBan.expires_at ? new Date(ipBan.expires_at * 1000).toISOString() : null;
-      return res.status(403).send(banPage(ipBan.reason || 'No reason provided', expISO, ipBan.username || 'Unknown'));
+// ── Rate limiting (no API key needed) ────────────────────────────
+const _rl = new Map();
+function rateLimit(maxReqs, windowMs) {
+  return (req, res, next) => {
+    const ip = getIP(req);
+    const now = Date.now();
+    if (!_rl.has(ip)) _rl.set(ip, []);
+    const hits = _rl.get(ip).filter(t => now - t < windowMs);
+    hits.push(now);
+    _rl.set(ip, hits);
+    if (hits.length > maxReqs) {
+      return res.status(429).json({ error: 'Too many requests — slow down.' });
     }
-  } catch(_) {}
-
-  // 4. Skip static files from heavy checks
-  const isStatic = /\.(js|css|png|jpg|gif|ico|svg|woff|woff2|ttf|otf|webm|mp4)$/.test(path);
-  if (isStatic) return next();
-
-  // 5. URL length check
-  if (req.url.length > _shield.LIMITS.max_url_len) {
-    _shieldAddStrike(ip, 'URL too long: ' + req.url.length + ' chars');
-    return res.status(414).json({ error: 'URI too long' });
-  }
-
-  // 6. Bad path detection (scanner/exploit probes)
-  for (const pat of _shield.badPaths) {
-    if (pat.test(path) || pat.test(req.url)) {
-      _shieldAddStrike(ip, 'Bad path probe: ' + path);
-      return res.status(404).json({ error: 'Not found' });
-    }
-  }
-
-  // 7. Bad user-agent detection — only when NOT behind Cloudflare
-  // (CF already blocks known bots; behind CF, UA is usually legitimate)
-  if (ua && !behindCF) {
-    for (const bad of _shield.badUAs) {
-      if (ua.includes(bad)) {
-        _shieldAddStrike(ip, 'Bad UA: ' + ua.slice(0, 80));
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-    }
-  }
-
-  // 8. Method validation
-  const allowedMethods = ['GET', 'POST', 'PATCH', 'DELETE', 'PUT', 'OPTIONS', 'HEAD'];
-  if (!allowedMethods.includes(method)) {
-    _shieldAddStrike(ip, 'Invalid HTTP method: ' + method);
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
-  // 9. Payload size check
-  const contentLen = parseInt(req.headers['content-length'] || '0');
-  if (contentLen > _shield.LIMITS.max_body) {
-    _shieldAddStrike(ip, 'Oversized payload: ' + contentLen);
-    return res.status(413).json({ error: 'Payload too large' });
-  }
-
-  // 10. Per-IP rate limiting with sliding window
-  const ipState = _shield.ips.get(ip) || { count: 0, window_start: now, min_count: 0, min_start: now, strikes: 0 };
-
-  // Per-second window
-  if (now - ipState.window_start > 1000) {
-    ipState.count = 0;
-    ipState.window_start = now;
-  }
-  ipState.count++;
-
-  // Per-minute window
-  if (now - (ipState.min_start || now) > 60000) {
-    ipState.min_count = 0;
-    ipState.min_start = now;
-  }
-  ipState.min_count = (ipState.min_count || 0) + 1;
-  ipState.last_req = now;
-  _shield.ips.set(ip, ipState);
-
-  if (ipState.count > _shield.LIMITS.req_per_sec) {
-    _shieldAddStrike(ip, `Rate: ${ipState.count} req/s (limit ${_shield.LIMITS.req_per_sec})`);
-    return res.status(429).set('Retry-After', '1').json({ error: 'Rate limit exceeded' });
-  }
-  if (ipState.min_count > _shield.LIMITS.req_per_min) {
-    _shieldTempBan(ip, `${ipState.min_count} req/min (limit ${_shield.LIMITS.req_per_min})`);
-    return res.status(429).set('Retry-After', '60').json({ error: 'Rate limit exceeded' });
-  }
-
-  // 11. Global flood detection
-  if (now - _shield.globalRpsWindow > 1000) {
-    _shield.globalRps = 0;
-    _shield.globalRpsWindow = now;
-    _shield.globalBlocked = false;
-  }
-  _shield.globalRps++;
-  if (_shield.globalRps > _shield.LIMITS.global_rps) {
-    _shield.globalBlocked = true;
-    _shieldAlert('FLOOD', 'GLOBAL', `${_shield.globalRps} req/s — flood mode activated`);
-    return res.status(503).set('Retry-After', '10').send('Service temporarily unavailable. Please wait.');
-  }
-
-  // 12. Header anomaly detection
-  const host = req.headers['host'] || '';
-  if (!host) {
-    _shieldAddStrike(ip, 'Missing Host header');
-    return res.status(400).json({ error: 'Bad request' });
-  }
-
-  // 13. SQL injection / XSS pattern in query params
-  const queryStr = JSON.stringify(req.query || '');
-  const dangerous = [/union\s+select/i, /drop\s+table/i, /exec\s*\(/i, /<script/i, /javascript:/i, /\bOR\b.+=.+/i, /--\s*$/];
-  for (const pat of dangerous) {
-    if (pat.test(queryStr)) {
-      _shieldAddStrike(ip, 'Injection attempt in query: ' + queryStr.slice(0, 100));
-      return res.status(400).json({ error: 'Bad request' });
-    }
-  }
-
-  next();
-});
-
-// ── Stricter auth rate limiting ───────────────────────────────────
-const authRL = (req, res, next) => {
-  const ip = _shieldGetIP(req);
-  const now = Date.now();
-  const state = _shield.ips.get(ip) || {};
-  if (now - (state.auth_win || 0) > 60000) { state.auth_count = 0; state.auth_win = now; }
-  state.auth_count = (state.auth_count || 0) + 1;
-  _shield.ips.set(ip, { ...(_shield.ips.get(ip) || {}), ...state });
-  if (state.auth_count > _shield.LIMITS.auth_per_min) {
-    _shieldAddStrike(ip, `Auth brute force: ${state.auth_count} attempts/min`);
-    return res.status(429).json({ error: 'Too many auth attempts. Try again in a minute.' });
-  }
-  next();
-};
-
-// ── Shield status API (owners only) ──────────────────────────────
-app.get('/api/owner/shield', auth, (req, res) => {
-  if (!isOwner(req.user.username)) return res.status(403).json({ error: 'Owner only' });
-  const blocked = [];
-  _shield.ips.forEach((v, k) => {
-    if (v.blocked_until && v.blocked_until > Date.now()) blocked.push({ ip: k, until: v.blocked_until, reason: v.block_reason, strikes: v.strikes });
-  });
-  res.json({
-    globalRps: _shield.globalRps,
-    globalBlocked: _shield.globalBlocked,
-    trackedIPs: _shield.ips.size,
-    tempBlocked: blocked,
-    recentAlerts: _shield.alerts.slice(0, 50),
-  });
-});
-
-// ── Clean up shield state every 30 minutes ────────────────────────
-setInterval(() => {
-  const now = Date.now();
-  _shield.ips.forEach((v, k) => {
-    if (now - (v.last_req || 0) > 1800000) _shield.ips.delete(k); // drop IPs idle 30 min
-  });
-}, 1800000);
-
+    next();
+  };
+}
+// Aggressive rate limit on auth endpoints
+const authRL = rateLimit(10, 60000);   // 10 per minute
+const apiRL  = rateLimit(120, 60000);  // 120 per minute general
+// Clean up old rate limit entries every 5 minutes
+setInterval(() => { const now = Date.now(); _rl.forEach((v,k) => { if (!v.some(t => now-t < 120000)) _rl.delete(k); }); }, 300000);
 
 function seedDB() {
   if (db.prepare('SELECT COUNT(*) as c FROM servers').get().c > 0) return;
@@ -421,6 +140,16 @@ db.prepare('UPDATE announcements SET active=0').run();
 
 app.use(express.json({ limit: '20mb' }));
 app.use(cookieParser());
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+// Apply general rate limit to all API routes
+app.use('/api/', apiRL);
 app.use('/uploads', express.static(UDIR));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -527,7 +256,7 @@ app.use((req, res, next) => {
 });
 
 function getIP(req) {
-  return getRealIP(req);
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
 }
 
 function _chkIPBan(ip) {
