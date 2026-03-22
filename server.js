@@ -99,27 +99,198 @@ safeAddColumn('user_settings', 'theme_blend', 'TEXT');
 safeAddColumn('user_settings', 'theme_blend_opacity', 'INTEGER DEFAULT 30');
 safeAddColumn('user_settings', 'theme_no_ui', 'INTEGER DEFAULT 0');
 
-// ── Rate limiting (no API key needed) ────────────────────────────
-const _rl = new Map();
-function rateLimit(maxReqs, windowMs) {
-  return (req, res, next) => {
-    const ip = getIP(req);
-    const now = Date.now();
-    if (!_rl.has(ip)) _rl.set(ip, []);
-    const hits = _rl.get(ip).filter(t => now - t < windowMs);
-    hits.push(now);
-    _rl.set(ip, hits);
-    if (hits.length > maxReqs) {
-      return res.status(429).json({ error: 'Too many requests — slow down.' });
-    }
-    next();
-  };
+// ══════════════════════════════════════════════════════════
+// MOLECORD SHIELD — DDoS + Intrusion Detection (no API key)
+// ══════════════════════════════════════════════════════════
+const _shield = {
+  ips: new Map(), alerts: [],
+  globalRps: 0, globalRpsWindow: Date.now(), globalBlocked: false,
+  badPaths: [
+    /\/\.env/i,/\/\.git/i,/\/wp-admin/i,/\/wp-login/i,/\/phpmyadmin/i,
+    /\/shell\.php/i,/\/cmd\.php/i,/\/etc\/passwd/i,/\/proc\/self/i,
+    /\/xmlrpc/i,/\/cgi-bin/i,/\/boaform/i,/\/setup\.cgi/i,
+    /select.*from/i,/union.*select/i,/drop.*table/i,
+    /<script/i,/javascript:/i,/onerror=/i,/\.\.\//,/\/config\.php/i,
+  ],
+  badUAs: ['masscan','zgrab','nmap','nikto','sqlmap','dirbuster','hydra',
+    'metasploit','nuclei','gobuster','ffuf','wfuzz','havij','acunetix','nessus'],
+  LIMITS: {
+    req_per_sec:25, req_per_min:300, auth_per_min:8, global_rps:500,
+    max_url_len:2048, strikes_before_ban:5, temp_ban_ms:15*60000, hard_ban_strikes:15,
+  },
+};
+
+// Cloudflare edge IP prefixes — never rate-limit these
+const CF_RANGES = [
+  '173.245.48.','103.21.244.','103.22.200.','103.31.4.','141.101.64.',
+  '108.162.192.','190.93.240.','188.114.96.','197.234.240.','198.41.128.',
+  '162.158.','104.16.','104.17.','104.18.','104.19.','104.20.','104.21.',
+  '104.22.','104.23.','104.24.','104.25.','104.26.','104.27.',
+  '172.64.','172.65.','172.66.','172.67.','172.68.','172.69.','172.70.','172.71.',
+  '131.0.72.',
+];
+function isCFIP(ip) { return CF_RANGES.some(r => ip.startsWith(r)); }
+
+// Always get real visitor IP — CF-Connecting-IP is injected by Cloudflare
+function getRealIP(req) {
+  const cf = req.headers['cf-connecting-ip'];
+  if (cf) return cf.trim();
+  const fwd = req.headers['x-forwarded-for'];
+  if (fwd) return fwd.split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
 }
-// Aggressive rate limit on auth endpoints
-const authRL = rateLimit(10, 60000);   // 10 per minute
-const apiRL  = rateLimit(120, 60000);  // 120 per minute general
-// Clean up old rate limit entries every 5 minutes
-setInterval(() => { const now = Date.now(); _rl.forEach((v,k) => { if (!v.some(t => now-t < 120000)) _rl.delete(k); }); }, 300000);
+
+function _shieldGetIP(req) { return getRealIP(req); }
+
+function _shieldAlert(type, ip, detail) {
+  const entry = { type, ip, detail, ts: Date.now() };
+  _shield.alerts.unshift(entry);
+  if (_shield.alerts.length > 200) _shield.alerts.length = 200;
+  logActivity('SHIELD_'+type,'',null,ip,detail);
+  try {
+    const msg = JSON.stringify({ type:'SHIELD_ALERT', alert:entry });
+    wss.clients.forEach(ws => {
+      const uid = wsUsers.get(ws);
+      if (uid) { const u = db.prepare('SELECT username FROM users WHERE id=?').get(uid); if (u && isOwner(u.username) && ws.readyState===1) ws.send(msg); }
+    });
+  } catch(_) {}
+}
+function _shieldTempBan(ip, reason) {
+  const s = _shield.ips.get(ip)||{};
+  s.blocked_until = Date.now()+_shield.LIMITS.temp_ban_ms;
+  s.block_reason = reason;
+  _shield.ips.set(ip, s);
+  _shieldAlert('TEMP_BAN', ip, reason);
+}
+function _shieldStrike(ip, reason) {
+  const s = _shield.ips.get(ip)||{ count:0, strikes:0 };
+  s.strikes = (s.strikes||0)+1;
+  _shield.ips.set(ip, s);
+  if (s.strikes >= _shield.LIMITS.hard_ban_strikes) {
+    try {
+      db.prepare('UPDATE ip_bans SET active=0 WHERE ip=? AND active=1').run(ip);
+      db.prepare('INSERT INTO ip_bans(id,ip,username,banned_by,reason,expires_at,active) VALUES(?,?,?,?,?,?,1)').run(require('crypto').randomUUID(),ip,'','SHIELD','Auto-banned: '+reason,null);
+    } catch(_) {}
+    _shieldAlert('PERM_BAN', ip, 'Auto perm-banned after '+s.strikes+' strikes: '+reason);
+  } else if (s.strikes >= _shield.LIMITS.strikes_before_ban) {
+    _shieldTempBan(ip, 'Too many strikes: '+reason);
+  } else {
+    _shieldAlert('STRIKE', ip, 'Strike '+s.strikes+': '+reason);
+  }
+}
+
+// Shield middleware — runs on every request
+app.use((req, res, next) => {
+  const ip = _shieldGetIP(req);
+  const rawIp = req.socket.remoteAddress||'';
+  const now = Date.now();
+  const p = req.path||'/';
+  const ua = (req.headers['user-agent']||'').toLowerCase();
+  const behindCF = isCFIP(rawIp)||!!req.headers['cf-connecting-ip'];
+
+  // Global flood mode
+  if (_shield.globalBlocked && now-_shield.globalRpsWindow<10000)
+    return res.status(503).set('Retry-After','10').send('Service temporarily unavailable.');
+
+  // Per-IP temp ban
+  const st = _shield.ips.get(ip);
+  if (st?.blocked_until && st.blocked_until>now)
+    return res.status(429).set('Retry-After',Math.ceil((st.blocked_until-now)/1000)).json({ error:'Too many requests. Try again later.' });
+
+  // Permanent IP ban
+  try {
+    const ban = db.prepare('SELECT * FROM ip_bans WHERE ip=? AND active=1 ORDER BY created_at DESC LIMIT 1').get(ip);
+    if (ban) {
+      if (p.startsWith('/api/')) return res.status(403).json({ error:'ip_banned', reason:ban.reason, expiresAt:ban.expires_at });
+      const exp = ban.expires_at ? new Date(ban.expires_at*1000).toISOString() : null;
+      return res.status(403).send(banPage(ban.reason||'No reason', exp, ban.username||'Unknown'));
+    }
+  } catch(_) {}
+
+  // Skip static assets
+  if (/\.(js|css|png|jpg|gif|ico|svg|woff|woff2|ttf|otf|webm|mp4)$/.test(p)) return next();
+
+  // URL too long
+  if (req.url.length > _shield.LIMITS.max_url_len) {
+    _shieldStrike(ip, 'URL too long: '+req.url.length);
+    return res.status(414).json({ error:'URI too long' });
+  }
+
+  // Bad path probes
+  for (const pat of _shield.badPaths) {
+    if (pat.test(p)||pat.test(req.url)) {
+      _shieldStrike(ip, 'Bad path: '+p);
+      return res.status(404).json({ error:'Not found' });
+    }
+  }
+
+  // Bad UA — only on direct connections, CF filters bots at edge
+  if (ua && !behindCF) {
+    for (const bad of _shield.badUAs) {
+      if (ua.includes(bad)) { _shieldStrike(ip,'Bad UA: '+ua.slice(0,80)); return res.status(403).json({ error:'Forbidden' }); }
+    }
+  }
+
+  // Bad HTTP method
+  if (!['GET','POST','PATCH','DELETE','PUT','OPTIONS','HEAD'].includes(req.method)) {
+    _shieldStrike(ip,'Bad method: '+req.method);
+    return res.status(405).json({ error:'Method not allowed' });
+  }
+
+  // Per-IP rate limit
+  const ipSt = _shield.ips.get(ip)||{ count:0, window_start:now, min_count:0, min_start:now, strikes:0 };
+  if (now-ipSt.window_start>1000) { ipSt.count=0; ipSt.window_start=now; }
+  ipSt.count++;
+  if (now-(ipSt.min_start||now)>60000) { ipSt.min_count=0; ipSt.min_start=now; }
+  ipSt.min_count=(ipSt.min_count||0)+1;
+  ipSt.last_req=now;
+  _shield.ips.set(ip,ipSt);
+  if (ipSt.count>_shield.LIMITS.req_per_sec) { _shieldStrike(ip,`${ipSt.count} req/s`); return res.status(429).set('Retry-After','1').json({ error:'Rate limit exceeded' }); }
+  if (ipSt.min_count>_shield.LIMITS.req_per_min) { _shieldTempBan(ip,`${ipSt.min_count} req/min`); return res.status(429).set('Retry-After','60').json({ error:'Rate limit exceeded' }); }
+
+  // Global flood detection
+  if (now-_shield.globalRpsWindow>1000) { _shield.globalRps=0; _shield.globalRpsWindow=now; _shield.globalBlocked=false; }
+  _shield.globalRps++;
+  if (_shield.globalRps>_shield.LIMITS.global_rps) {
+    _shield.globalBlocked=true; _shieldAlert('FLOOD','GLOBAL',`${_shield.globalRps} req/s`);
+    return res.status(503).set('Retry-After','10').send('Service temporarily unavailable.');
+  }
+
+  // Injection in query params
+  const qs=JSON.stringify(req.query||'');
+  for (const pat of [/union\s+select/i,/drop\s+table/i,/<script/i,/javascript:/i]) {
+    if (pat.test(qs)) { _shieldStrike(ip,'Injection: '+qs.slice(0,80)); return res.status(400).json({ error:'Bad request' }); }
+  }
+
+  next();
+});
+
+// Stricter auth rate limit
+const authRL = (req,res,next) => {
+  const ip=_shieldGetIP(req), now=Date.now();
+  const s=_shield.ips.get(ip)||{};
+  if (now-(s.auth_win||0)>60000) { s.auth_count=0; s.auth_win=now; }
+  s.auth_count=(s.auth_count||0)+1;
+  _shield.ips.set(ip,{...(_shield.ips.get(ip)||{}),...s});
+  if (s.auth_count>_shield.LIMITS.auth_per_min) {
+    _shieldStrike(ip,`Auth brute force: ${s.auth_count}/min`);
+    return res.status(429).json({ error:'Too many auth attempts. Try again in a minute.' });
+  }
+  next();
+};
+
+// Shield status (owners only)
+app.get('/api/owner/shield', auth, (req,res) => {
+  if (!isOwner(req.user.username)) return res.status(403).json({ error:'Owner only' });
+  const blocked=[];
+  _shield.ips.forEach((v,k) => { if (v.blocked_until&&v.blocked_until>Date.now()) blocked.push({ ip:k, until:v.blocked_until, reason:v.block_reason, strikes:v.strikes }); });
+  res.json({ globalRps:_shield.globalRps, globalBlocked:_shield.globalBlocked, trackedIPs:_shield.ips.size, tempBlocked:blocked, recentAlerts:_shield.alerts.slice(0,50) });
+});
+
+// Clean idle IPs every 30 min
+setInterval(() => { const now=Date.now(); _shield.ips.forEach((v,k)=>{ if (now-(v.last_req||0)>1800000) _shield.ips.delete(k); }); }, 1800000);
+
+
 
 function seedDB() {
   if (db.prepare('SELECT COUNT(*) as c FROM servers').get().c > 0) return;
@@ -140,16 +311,6 @@ db.prepare('UPDATE announcements SET active=0').run();
 
 app.use(express.json({ limit: '20mb' }));
 app.use(cookieParser());
-// Security headers
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  next();
-});
-// Apply general rate limit to all API routes
-app.use('/api/', apiRL);
 app.use('/uploads', express.static(UDIR));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -255,9 +416,7 @@ app.use((req, res, next) => {
   next();
 });
 
-function getIP(req) {
-  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
-}
+function getIP(req) { return getRealIP(req); }
 
 function _chkIPBan(ip) {
   if (!ip || ip === 'unknown') return null;
