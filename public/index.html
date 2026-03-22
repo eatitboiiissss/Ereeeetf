@@ -455,7 +455,7 @@ input,textarea,select{font-family:inherit;outline:none;border:none;-webkit-appea
     <!-- RAIL (desktop) -->
     <div class="rail" id="rail">
       <div class="rb" id="rb-friends" onclick="showFriends()" title="Friends">👥<div class="rbadge hidden" id="fr-badge">0</div></div>
-      <div class="rb" id="rb-wall" onclick="showWall()" title="Wall of Bad People" style="font-size:16px">🚫</div>
+      <div class="rb" id="rb-wall" onclick="showWall()" title="Wall of Retards" style="font-size:16px">🚫</div>
       <div class="rsep"></div>
       <div id="srv-rail"></div>
       <div class="rsep"></div>
@@ -1340,14 +1340,14 @@ function showFriends(){view='friends';activeChId=null;activeDMId=null;activeGrou
 function showWall(){
   view='wall';activeChId=null;activeDMId=null;activeGroupId=null;activeSrvId=null;
   renderRail();$('mp').classList.add('hidden');closeMobSB();
-  $('sbt').textContent='Wall of Bad People';$('srv-ban').classList.remove('show');
+  $('sbt').textContent='Wall of Retards';$('srv-ban').classList.remove('show');
   $('sbbody').innerHTML='';
   renderWall();
 }
 function renderWall(){
   const isAdmin=me?.isAdmin||me?.isOwner;
   $('main').innerHTML=`
-    <div class="chhdr"><button class="chhdr-mob" onclick="openMobSB()">☰</button><span style="font-size:16px">🚫</span><h3>Wall of Bad People</h3></div>
+    <div class="chhdr"><button class="chhdr-mob" onclick="openMobSB()">☰</button><span style="font-size:16px">🚫</span><h3>Wall of Retards</h3></div>
     <div style="padding:16px;max-width:700px">
       ${isAdmin?`<div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:12px;padding:16px;margin-bottom:18px">
         <h4 style="font-size:13px;font-weight:700;margin-bottom:10px;color:var(--t1)">Add to Wall</h4>
