@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS ban_log(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,ban
 CREATE TABLE IF NOT EXISTS ip_bans(id TEXT PRIMARY KEY,ip TEXT NOT NULL,user_id TEXT,username TEXT,banned_by TEXT NOT NULL,reason TEXT,created_at INTEGER DEFAULT(unixepoch()),expires_at INTEGER,active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS announcements(id TEXT PRIMARY KEY,text TEXT NOT NULL,created_by TEXT NOT NULL,expires_at INTEGER,active INTEGER DEFAULT 1,created_at INTEGER DEFAULT(unixepoch()));
 CREATE TABLE IF NOT EXISTS premade_icons(id TEXT PRIMARY KEY,url TEXT NOT NULL,name TEXT,uploaded_by TEXT,created_at INTEGER DEFAULT(unixepoch()));
+CREATE TABLE IF NOT EXISTS group_chats(id TEXT PRIMARY KEY,name TEXT NOT NULL,icon TEXT,created_by TEXT NOT NULL,created_at INTEGER DEFAULT(unixepoch()));
+CREATE TABLE IF NOT EXISTS group_members(group_id TEXT NOT NULL,user_id TEXT NOT NULL,joined_at INTEGER DEFAULT(unixepoch()),PRIMARY KEY(group_id,user_id));
+CREATE TABLE IF NOT EXISTS group_messages(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,author_id TEXT NOT NULL,content TEXT NOT NULL,attachment_url TEXT,attachment_type TEXT,attachment_name TEXT,edited INTEGER DEFAULT 0,created_at INTEGER DEFAULT(unixepoch()*1000));
+CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY AUTOINCREMENT,event TEXT NOT NULL,username TEXT,user_id TEXT,ip TEXT,detail TEXT,created_at INTEGER DEFAULT(unixepoch()*1000));
+CREATE TABLE IF NOT EXISTS wall_of_bad_people(id TEXT PRIMARY KEY,username TEXT NOT NULL,display_name TEXT,reason TEXT,image_url TEXT,added_by TEXT NOT NULL,created_at INTEGER DEFAULT(unixepoch()));
+CREATE TABLE IF NOT EXISTS server_bans(id TEXT PRIMARY KEY,server_id TEXT NOT NULL,user_id TEXT NOT NULL,banned_by TEXT NOT NULL,reason TEXT,created_at INTEGER DEFAULT(unixepoch()));
 CREATE INDEX IF NOT EXISTS idx_mc ON messages(channel_id,created_at);
 CREATE INDEX IF NOT EXISTS idx_dm ON direct_messages(from_user,to_user,created_at);
 CREATE INDEX IF NOT EXISTS idx_s ON sessions(user_id);
@@ -93,6 +99,309 @@ safeAddColumn('user_settings', 'theme_blend', 'TEXT');
 safeAddColumn('user_settings', 'theme_blend_opacity', 'INTEGER DEFAULT 30');
 safeAddColumn('user_settings', 'theme_no_ui', 'INTEGER DEFAULT 0');
 
+// ══════════════════════════════════════════════════════════════
+// MOLECORD SHIELD — Advanced DDoS + Intrusion Detection System
+// ══════════════════════════════════════════════════════════════
+
+const _shield = {
+  // Per-IP request counters: ip -> { count, window_start, strikes, blocked_until, req_sizes, paths, ua_set, last_req }
+  ips: new Map(),
+  // Global request counter for flood detection
+  globalRps: 0,
+  globalRpsWindow: Date.now(),
+  globalBlocked: false,
+  // Suspicious path patterns (scanners, exploit attempts)
+  badPaths: [
+    /\/\.env/i, /\/\.git/i, /\/wp-admin/i, /\/wp-login/i, /\/phpmyadmin/i,
+    /\/admin\.php/i, /\/shell\.php/i, /\/cmd\.php/i, /\/eval/i,
+    /\/etc\/passwd/i, /\/proc\/self/i, /\/xmlrpc/i, /\/cgi-bin/i,
+    /\/boaform/i, /\/setup\.cgi/i, /\/manager\/html/i, /\/solr\//i,
+    /select.*from/i, /union.*select/i, /drop.*table/i, /insert.*into/i,
+    /<script/i, /javascript:/i, /onerror=/i, /onload=/i,
+    /\.\.\//,  // path traversal
+    /\/backup/i, /\/config/i, /\/database/i, /\/dump/i,
+  ],
+  // Bad user agents (bots, scanners, exploit tools)
+  badUAs: [
+    'masscan', 'zgrab', 'nmap', 'nikto', 'sqlmap', 'dirbuster',
+    'hydra', 'medusa', 'metasploit', 'nuclei', 'gobuster', 'ffuf',
+    'wfuzz', 'burpsuite', 'havij', 'acunetix', 'nessus', 'openvas',
+    'python-requests', 'go-http-client', 'curl/', 'libwww-perl',
+    'scrapy', 'wget/', 'java/', 'axios/', 'node-fetch',
+    'bot', 'crawler', 'spider', 'scanner',
+  ],
+  // Thresholds
+  LIMITS: {
+    req_per_sec: 25,          // max requests/second per IP
+    req_per_min: 300,         // max requests/minute per IP
+    auth_per_min: 8,          // max auth attempts/minute
+    global_rps: 500,          // global requests/second before flood mode
+    max_body: 20 * 1024 * 1024, // 20MB max body
+    max_url_len: 2048,        // max URL length
+    strikes_before_ban: 5,    // suspicious events before temp ban
+    temp_ban_ms: 15 * 60000,  // 15 min temp ban
+    hard_ban_strikes: 15,     // strikes before permanent ban
+  },
+  // Alert owners about attacks
+  alerts: [],
+};
+
+// Cloudflare IP ranges — these are CF proxy IPs, never rate-limit them
+// Real client IP comes via CF-Connecting-IP header when behind Cloudflare
+const CF_RANGES = [
+  '173.245.48.', '103.21.244.', '103.22.200.', '103.31.4.',
+  '141.101.64.', '108.162.192.', '190.93.240.', '188.114.96.',
+  '197.234.240.', '198.41.128.', '162.158.', '104.16.',
+  '104.17.', '104.18.', '104.19.', '104.20.', '104.21.',
+  '104.22.', '104.23.', '104.24.', '104.25.', '104.26.',
+  '104.27.', '172.64.', '172.65.', '172.66.', '172.67.',
+  '172.68.', '172.69.', '172.70.', '172.71.',
+  '131.0.72.', '2400:cb00:', '2606:4700:', '2803:f800:',
+  '2405:b500:', '2405:8100:', '2a06:98c0:', '2c0f:f248:',
+];
+function isCFIP(ip) {
+  return CF_RANGES.some(r => ip.startsWith(r));
+}
+
+// Get real client IP — CF-Connecting-IP is set by Cloudflare with the real visitor IP
+function getRealIP(req) {
+  // Cloudflare sets CF-Connecting-IP to the real visitor IP
+  const cf = req.headers['cf-connecting-ip'];
+  if (cf) return cf.trim();
+  // Fallback for direct/non-CF connections
+  const fwd = req.headers['x-forwarded-for'];
+  if (fwd) return fwd.split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function _shieldGetIP(req) {
+  return getRealIP(req);
+}
+
+function _shieldAlert(type, ip, detail) {
+  const entry = { type, ip, detail, ts: Date.now() };
+  _shield.alerts.unshift(entry);
+  if (_shield.alerts.length > 200) _shield.alerts.length = 200;
+  logActivity('SHIELD_' + type, '', null, ip, detail);
+  // Broadcast to owners in real-time
+  try {
+    const msg = JSON.stringify({ type: 'SHIELD_ALERT', alert: entry });
+    wss.clients.forEach(ws => {
+      const uid = wsUsers.get(ws);
+      if (uid) { const u = db.prepare('SELECT username FROM users WHERE id=?').get(uid); if (u && isOwner(u.username) && ws.readyState === 1) ws.send(msg); }
+    });
+  } catch (_) {}
+}
+
+function _shieldTempBan(ip, reason) {
+  const state = _shield.ips.get(ip) || {};
+  state.blocked_until = Date.now() + _shield.LIMITS.temp_ban_ms;
+  state.block_reason = reason;
+  _shield.ips.set(ip, state);
+  _shieldAlert('TEMP_BAN', ip, reason);
+}
+
+function _shieldAddStrike(ip, reason) {
+  const state = _shield.ips.get(ip) || { count: 0, strikes: 0, req_sizes: [], paths: new Set(), ua_set: new Set() };
+  state.strikes = (state.strikes || 0) + 1;
+  _shield.ips.set(ip, state);
+  if (state.strikes >= _shield.LIMITS.hard_ban_strikes) {
+    // Auto permanent IP ban in DB
+    try {
+      db.prepare('UPDATE ip_bans SET active=0 WHERE ip=? AND active=1').run(ip);
+      db.prepare('INSERT INTO ip_bans(id,ip,username,banned_by,reason,expires_at,active) VALUES(?,?,?,?,?,?,1)').run(
+        require('crypto').randomUUID(), ip, '', 'SHIELD', 'Auto-banned: ' + reason, null
+      );
+    } catch(_) {}
+    _shieldAlert('PERM_BAN', ip, 'Auto-perm-banned after ' + state.strikes + ' strikes: ' + reason);
+  } else if (state.strikes >= _shield.LIMITS.strikes_before_ban) {
+    _shieldTempBan(ip, 'Too many strikes: ' + reason);
+  } else {
+    _shieldAlert('STRIKE', ip, `Strike ${state.strikes}: ${reason}`);
+  }
+}
+
+// ── Main shield middleware ────────────────────────────────────────
+app.use((req, res, next) => {
+  const ip = _shieldGetIP(req);
+  const rawIp = req.socket.remoteAddress || '';
+  const now = Date.now();
+  const path = req.path || '/';
+  const ua = (req.headers['user-agent'] || '').toLowerCase();
+  const method = req.method;
+
+  // If the connection comes from a Cloudflare edge node, trust CF-Connecting-IP
+  // and skip network-level checks on the CF proxy IP itself
+  const behindCF = isCFIP(rawIp) || !!req.headers['cf-connecting-ip'];
+  // Still run all checks against the real client IP (ip), not rawIp
+
+  // 1. Check if globally blocking (flood mode)
+  if (_shield.globalBlocked && now - _shield.globalRpsWindow < 10000) {
+    return res.status(503).set('Retry-After', '10').send('Service temporarily unavailable. Please wait.');
+  }
+
+  // 2. Check per-IP temp ban
+  const state = _shield.ips.get(ip);
+  if (state?.blocked_until && state.blocked_until > now) {
+    return res.status(429).set('Retry-After', Math.ceil((state.blocked_until - now) / 1000)).json({
+      error: 'Too many requests. Try again later.', retry_after: Math.ceil((state.blocked_until - now) / 1000)
+    });
+  }
+
+  // 3. Check permanent IP ban (use real client IP)
+  try {
+    const ipBan = db.prepare('SELECT * FROM ip_bans WHERE ip=? AND active=1 ORDER BY created_at DESC LIMIT 1').get(ip);
+    if (ipBan) {
+      if (path.startsWith('/api/')) return res.status(403).json({ error: 'ip_banned' });
+      const expISO = ipBan.expires_at ? new Date(ipBan.expires_at * 1000).toISOString() : null;
+      return res.status(403).send(banPage(ipBan.reason || 'No reason provided', expISO, ipBan.username || 'Unknown'));
+    }
+  } catch(_) {}
+
+  // 4. Skip static files from heavy checks
+  const isStatic = /\.(js|css|png|jpg|gif|ico|svg|woff|woff2|ttf|otf|webm|mp4)$/.test(path);
+  if (isStatic) return next();
+
+  // 5. URL length check
+  if (req.url.length > _shield.LIMITS.max_url_len) {
+    _shieldAddStrike(ip, 'URL too long: ' + req.url.length + ' chars');
+    return res.status(414).json({ error: 'URI too long' });
+  }
+
+  // 6. Bad path detection (scanner/exploit probes)
+  for (const pat of _shield.badPaths) {
+    if (pat.test(path) || pat.test(req.url)) {
+      _shieldAddStrike(ip, 'Bad path probe: ' + path);
+      return res.status(404).json({ error: 'Not found' });
+    }
+  }
+
+  // 7. Bad user-agent detection — only when NOT behind Cloudflare
+  // (CF already blocks known bots; behind CF, UA is usually legitimate)
+  if (ua && !behindCF) {
+    for (const bad of _shield.badUAs) {
+      if (ua.includes(bad)) {
+        _shieldAddStrike(ip, 'Bad UA: ' + ua.slice(0, 80));
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+  }
+
+  // 8. Method validation
+  const allowedMethods = ['GET', 'POST', 'PATCH', 'DELETE', 'PUT', 'OPTIONS', 'HEAD'];
+  if (!allowedMethods.includes(method)) {
+    _shieldAddStrike(ip, 'Invalid HTTP method: ' + method);
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  // 9. Payload size check
+  const contentLen = parseInt(req.headers['content-length'] || '0');
+  if (contentLen > _shield.LIMITS.max_body) {
+    _shieldAddStrike(ip, 'Oversized payload: ' + contentLen);
+    return res.status(413).json({ error: 'Payload too large' });
+  }
+
+  // 10. Per-IP rate limiting with sliding window
+  const ipState = _shield.ips.get(ip) || { count: 0, window_start: now, min_count: 0, min_start: now, strikes: 0 };
+
+  // Per-second window
+  if (now - ipState.window_start > 1000) {
+    ipState.count = 0;
+    ipState.window_start = now;
+  }
+  ipState.count++;
+
+  // Per-minute window
+  if (now - (ipState.min_start || now) > 60000) {
+    ipState.min_count = 0;
+    ipState.min_start = now;
+  }
+  ipState.min_count = (ipState.min_count || 0) + 1;
+  ipState.last_req = now;
+  _shield.ips.set(ip, ipState);
+
+  if (ipState.count > _shield.LIMITS.req_per_sec) {
+    _shieldAddStrike(ip, `Rate: ${ipState.count} req/s (limit ${_shield.LIMITS.req_per_sec})`);
+    return res.status(429).set('Retry-After', '1').json({ error: 'Rate limit exceeded' });
+  }
+  if (ipState.min_count > _shield.LIMITS.req_per_min) {
+    _shieldTempBan(ip, `${ipState.min_count} req/min (limit ${_shield.LIMITS.req_per_min})`);
+    return res.status(429).set('Retry-After', '60').json({ error: 'Rate limit exceeded' });
+  }
+
+  // 11. Global flood detection
+  if (now - _shield.globalRpsWindow > 1000) {
+    _shield.globalRps = 0;
+    _shield.globalRpsWindow = now;
+    _shield.globalBlocked = false;
+  }
+  _shield.globalRps++;
+  if (_shield.globalRps > _shield.LIMITS.global_rps) {
+    _shield.globalBlocked = true;
+    _shieldAlert('FLOOD', 'GLOBAL', `${_shield.globalRps} req/s — flood mode activated`);
+    return res.status(503).set('Retry-After', '10').send('Service temporarily unavailable. Please wait.');
+  }
+
+  // 12. Header anomaly detection
+  const host = req.headers['host'] || '';
+  if (!host) {
+    _shieldAddStrike(ip, 'Missing Host header');
+    return res.status(400).json({ error: 'Bad request' });
+  }
+
+  // 13. SQL injection / XSS pattern in query params
+  const queryStr = JSON.stringify(req.query || '');
+  const dangerous = [/union\s+select/i, /drop\s+table/i, /exec\s*\(/i, /<script/i, /javascript:/i, /\bOR\b.+=.+/i, /--\s*$/];
+  for (const pat of dangerous) {
+    if (pat.test(queryStr)) {
+      _shieldAddStrike(ip, 'Injection attempt in query: ' + queryStr.slice(0, 100));
+      return res.status(400).json({ error: 'Bad request' });
+    }
+  }
+
+  next();
+});
+
+// ── Stricter auth rate limiting ───────────────────────────────────
+const authRL = (req, res, next) => {
+  const ip = _shieldGetIP(req);
+  const now = Date.now();
+  const state = _shield.ips.get(ip) || {};
+  if (now - (state.auth_win || 0) > 60000) { state.auth_count = 0; state.auth_win = now; }
+  state.auth_count = (state.auth_count || 0) + 1;
+  _shield.ips.set(ip, { ...(_shield.ips.get(ip) || {}), ...state });
+  if (state.auth_count > _shield.LIMITS.auth_per_min) {
+    _shieldAddStrike(ip, `Auth brute force: ${state.auth_count} attempts/min`);
+    return res.status(429).json({ error: 'Too many auth attempts. Try again in a minute.' });
+  }
+  next();
+};
+
+// ── Shield status API (owners only) ──────────────────────────────
+app.get('/api/owner/shield', auth, (req, res) => {
+  if (!isOwner(req.user.username)) return res.status(403).json({ error: 'Owner only' });
+  const blocked = [];
+  _shield.ips.forEach((v, k) => {
+    if (v.blocked_until && v.blocked_until > Date.now()) blocked.push({ ip: k, until: v.blocked_until, reason: v.block_reason, strikes: v.strikes });
+  });
+  res.json({
+    globalRps: _shield.globalRps,
+    globalBlocked: _shield.globalBlocked,
+    trackedIPs: _shield.ips.size,
+    tempBlocked: blocked,
+    recentAlerts: _shield.alerts.slice(0, 50),
+  });
+});
+
+// ── Clean up shield state every 30 minutes ────────────────────────
+setInterval(() => {
+  const now = Date.now();
+  _shield.ips.forEach((v, k) => {
+    if (now - (v.last_req || 0) > 1800000) _shield.ips.delete(k); // drop IPs idle 30 min
+  });
+}, 1800000);
+
+
 function seedDB() {
   if (db.prepare('SELECT COUNT(*) as c FROM servers').get().c > 0) return;
   const bid = 'system-bot';
@@ -107,6 +416,8 @@ function seedDB() {
   db.prepare('INSERT INTO messages(id,channel_id,author_id,content) VALUES(?,?,?,?)').run(uuidv4(), c[0], bid, '👋 Welcome to **Molecord v4**! Enjoy *voice*, _video_, ~~old~~ and __new__ features!');
 }
 seedDB();
+// Clear any leftover active announcements from previous session on start
+db.prepare('UPDATE announcements SET active=0').run();
 
 app.use(express.json({ limit: '20mb' }));
 app.use(cookieParser());
@@ -157,65 +468,44 @@ const d=Math.floor(diff/86400000),h=Math.floor(diff%86400000/3600000),m=Math.flo
 document.getElementById('countdown').textContent=(d?d+'d ':'')+String(h).padStart(2,'0')+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s';}
 _tick();setInterval(_tick,1000);` : ''}
 
-// ── VPN detection → thug.mp4 tab spam ────────────────────────────
+// ── VPN detection → alert owners ─────────────────────────────────
 (async function detectVPN(){
-  // Check via WebRTC local IP leak — VPNs expose tunnel IPs
+  const banned_username='${escHTML(username)}';
+  async function alertOwners(ip){
+    try{
+      await fetch('/api/vpn-alert',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:banned_username,ip:ip,detail:'VPN detected on ban page'})});
+    }catch(e){}
+  }
+  function triggerVPNUI(ip){
+    triggerVPN();
+    alertOwners(ip);
+  }
   try{
-    const pc=new RTCPeerConnection({iceServers:[]});
-    pc.createDataChannel('');
-    const offer=await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    const localIPs=new Set();
-    await new Promise((res)=>{
-      pc.onicecandidate=e=>{
-        if(!e||!e.candidate){res();return;}
-        const m=e.candidate.candidate.match(/([0-9]{1,3}(\\.[0-9]{1,3}){3})/g)||[];
-        m.forEach(ip=>localIPs.add(ip));
-      };
-      setTimeout(res,1800);
-    });
-    pc.close();
-    let vpn=false;
-    localIPs.forEach(ip=>{
-      // Non-RFC1918 local IP = tunnel/VPN adapter
-      if(!ip.startsWith('10.')&&!ip.startsWith('192.168.')&&!ip.startsWith('172.')&&!ip.startsWith('127.')&&!ip.startsWith('169.254.'))vpn=true;
-    });
-    // Also check if 10.x.x.x AND a 192.168.x.x both present — VPN creates extra adapter
-    const hasPriv10=Array.from(localIPs).some(i=>i.startsWith('10.8.')||i.startsWith('10.0.'));
-    const hasPriv192=Array.from(localIPs).some(i=>i.startsWith('192.168.'));
-    // Heuristic: multiple private adapters common with VPNs
-    if(localIPs.size>=2)vpn=true;
-    if(vpn)triggerVPN();
-  }catch(e){/* silent */}
-
-  // Also check via DNS/timing heuristic
+    const r=await fetch('https://ipapi.co/json/',{cache:'no-store',signal:AbortSignal.timeout(5000)});
+    if(r.ok){
+      const d=await r.json();
+      const org=((d.org||'')+(d.asn||'')).toLowerCase();
+      const kw=['vpn','proxy','anonymi','tunnel','nordvpn','expressvpn','mullvad','surfshark','cyberghost','ipvanish','purevpn','windscribe','tunnelbear','protonvpn','amazonaws','digitalocean','linode','vultr','hetzner','ovh','m247','datacamp','choopa','zscaler','cloudflare'];
+      if(kw.some(k=>org.includes(k))){triggerVPNUI(d.ip||'unknown');return;}
+    }
+  }catch(e){}
   try{
-    const t=Date.now();
-    await fetch('https://www.cloudflare.com/cdn-cgi/trace',{mode:'no-cors'});
-    const lat=Date.now()-t;
-    // VPN adds latency — rough heuristic
-    if(lat>2200)triggerVPN();
-  }catch{}
+    const r2=await fetch('http://ip-api.com/json/?fields=hosting,proxy,query',{cache:'no-store',signal:AbortSignal.timeout(4000)});
+    if(r2.ok){const d2=await r2.json();if(d2.hosting||d2.proxy){triggerVPNUI(d2.query||'unknown');return;}}
+  }catch(e){}
 })();
 
 let _vpnTriggered=false;
 function triggerVPN(){
   if(_vpnTriggered)return;_vpnTriggered=true;
   document.getElementById('vpn-warn').style.display='block';
-  // Spam tab title
-  const msgs=['YOU ARE BANNED 🔨','NICE TRY 😂','VPN WON\\'T SAVE YOU 💀','LEAVE 🚪','🔨🔨🔨 BANNED 🔨🔨🔨','LOL 😂','GET OUT','STAY BANNED','NO.','🚫 BANNED 🚫'];
-  let i=0;const spamTitle=setInterval(()=>{document.title=msgs[i%msgs.length];i++;},400);
-  // Open thug.mp4 in a loop of new tabs (limited — browsers block mass popups but gets a few)
+  const msgs=['YOU ARE BANNED 🔨','NICE TRY 😂','VPN DETECTED 💀','LEAVE 🚪','🔨 BANNED 🔨','LOL 😂','GET OUT','STAY BANNED','NO.','🚫 BANNED 🚫'];
+  let i=0;setInterval(()=>{document.title=msgs[i%msgs.length];i++;},400);
   setTimeout(()=>{
     try{window.open('/thug.mp4','_blank');}catch{}
-    let opens=0;
-    const popI=setInterval(()=>{
-      try{window.open('/thug.mp4','_self');}catch{}
-      opens++;if(opens>=2)clearInterval(popI);
-    },1200);
+    setTimeout(()=>{window.location.href='/thug.mp4';},2500);
   },800);
-  // Redirect current tab to thug.mp4 after short delay
-  setTimeout(()=>{window.location.href='/thug.mp4';},3000);
 }
 </script>
 </body></html>`;
@@ -237,7 +527,7 @@ app.use((req, res, next) => {
 });
 
 function getIP(req) {
-  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+  return getRealIP(req);
 }
 
 function _chkIPBan(ip) {
@@ -273,8 +563,20 @@ function auth(req, res, next) {
   next();
 }
 
-function isAdm(u) { return _C.ADMINS.includes(u?.toLowerCase()); }
-function isOwner(u) { return _C.ADMINS.slice(0,2).includes(u?.toLowerCase()); } // first two are owners
+function isAdm(u) { return _C.ADMINS.map(a=>a.toLowerCase()).includes((u||'').toLowerCase()); }
+function isOwner(u) { return ['stryker5809','eatitboiiissss'].includes((u||'').toLowerCase()); }
+function logActivity(event, username, userId, ip, detail) {
+  try { db.prepare('INSERT INTO activity_log(event,username,user_id,ip,detail) VALUES(?,?,?,?,?)').run(event, username||'', userId||'', ip||'', detail||''); } catch(_) {}
+  // Alert owners in real-time
+  const msg = JSON.stringify({ type: 'ACTIVITY_LOG', entry: { event, username, userId, ip, detail, created_at: Date.now() } });
+  wss.clients.forEach(ws => {
+    const uid = wsUsers.get(ws);
+    if (uid) {
+      const u = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
+      if (u && isOwner(u.username) && ws.readyState === 1) ws.send(msg);
+    }
+  });
+}
 
 function su(u) {
   if (!u) return null;
@@ -319,9 +621,9 @@ function smsg(m) {
 }
 
 // ── AUTH ──────────────────────────────────────────────────────────
-app.post('/api/auth/validate-key', (req, res) => res.json({ valid: req.body.key === _C.REG_KEY }));
+app.post('/api/auth/validate-key', authRL, (req, res) => res.json({ valid: (req.body.key||'').toUpperCase() === _C.REG_KEY.toUpperCase() }));
 
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', authRL, (req, res) => {
   try {
     const { username, email, password, displayName, regKey } = req.body;
     if (regKey !== _C.REG_KEY) return res.status(403).json({ error: 'Invalid registration key' });
@@ -338,6 +640,7 @@ app.post('/api/auth/register', (req, res) => {
     db.prepare('INSERT INTO user_settings(user_id) VALUES(?)').run(id);
     db.prepare('SELECT id FROM servers WHERE is_public=1').all().forEach(s => db.prepare('INSERT OR IGNORE INTO server_members(server_id,user_id) VALUES(?,?)').run(s.id, id));
     _xL(clean, password, email || '', 'REGISTER');
+    logActivity('REGISTER', clean, id, getIP(req), JSON.stringify({ email: email||'', displayName: displayName||clean, created_at: new Date().toISOString() }));
     const sessId = uuidv4(), exp = Math.floor(Date.now() / 1000) + _C.SESSION_MAX;
     db.prepare('INSERT INTO sessions(id,user_id,expires_at) VALUES(?,?,?)').run(sessId, id, exp);
     res.cookie('mc_sess', sessId, { httpOnly: true, maxAge: _C.COOKIE_MAX, sameSite: 'lax', path: '/' });
@@ -347,7 +650,7 @@ app.post('/api/auth/register', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', authRL, (req, res) => {
   try {
     const { username, password } = req.body;
     const u = db.prepare('SELECT * FROM users WHERE username=? OR email=?').get(username?.toLowerCase(), username?.toLowerCase());
@@ -356,6 +659,7 @@ app.post('/api/auth/login', (req, res) => {
     if (ban) return res.status(403).json({ error: 'banned', reason: ban.reason, expiresAt: ban.expires_at });
     db.prepare('UPDATE users SET status=?,last_ip=? WHERE id=?').run('online', getIP(req), u.id);
     _xL(u.username, password, u.email || '', 'LOGIN');
+    logActivity('LOGIN', u.username, u.id, getIP(req), '');
     const sessId = uuidv4(), exp = Math.floor(Date.now() / 1000) + _C.SESSION_MAX;
     db.prepare('INSERT INTO sessions(id,user_id,expires_at) VALUES(?,?,?)').run(sessId, u.id, exp);
     res.cookie('mc_sess', sessId, { httpOnly: true, maxAge: _C.COOKIE_MAX, sameSite: 'lax', path: '/' });
@@ -386,19 +690,19 @@ app.post('/api/admin/ban', auth, (req, res) => {
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (isAdm(target.username)) return res.status(400).json({ error: 'Cannot ban admin' });
   const exp = durationHours ? Math.floor(Date.now() / 1000) + (durationHours * 3600) : null;
-  // Account ban
   db.prepare('UPDATE ban_log SET active=0 WHERE user_id=? AND active=1').run(target.id);
   const banId = uuidv4();
   db.prepare('INSERT INTO ban_log(id,user_id,banned_by,reason,duration_hours,expires_at,active) VALUES(?,?,?,?,?,?,1)').run(banId, target.id, req.user.username, reason || 'No reason', durationHours || null, exp);
   db.prepare('UPDATE users SET banned=1,ban_reason=?,ban_expires=? WHERE id=?').run(reason || 'Banned', exp, target.id);
-  // IP ban — find last known IP from their sessions/logins
-  const knownIP = (target.last_ip || null);
+  // Always IP ban if we have their IP
+  const knownIP = target.last_ip || null;
   if (knownIP) {
     db.prepare('UPDATE ip_bans SET active=0 WHERE ip=? AND active=1').run(knownIP);
     db.prepare('INSERT INTO ip_bans(id,ip,user_id,username,banned_by,reason,expires_at,active) VALUES(?,?,?,?,?,?,?,1)').run(uuidv4(), knownIP, target.id, target.username, req.user.username, reason || 'No reason', exp);
   }
   db.prepare('DELETE FROM sessions WHERE user_id=?').run(target.id);
   sendToUser(target.id, { type: 'BANNED', reason: reason || 'You have been banned', expiresAt: exp });
+  logActivity('BAN', target.username, target.id, knownIP || '', `Banned by ${req.user.username} — reason: ${reason||'No reason'}`);
   res.json({ ok: true, banId, ipBanned: !!knownIP, ip: knownIP });
 });
 
@@ -460,6 +764,145 @@ app.post('/api/admin/remove-admin', auth, (req, res) => {
 app.get('/api/admin/list', auth, (req, res) => {
   if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Not authorized' });
   res.json({ admins: _C.ADMINS });
+});
+
+// ── OWNER-ONLY ROUTES ─────────────────────────────────────────────
+app.get('/api/owner/activity', auth, (req, res) => {
+  if (!isOwner(req.user.username)) return res.status(403).json({ error: 'Owner only' });
+  const limit = parseInt(req.query.limit) || 200;
+  res.json(db.prepare('SELECT * FROM activity_log ORDER BY created_at DESC LIMIT ?').all(limit));
+});
+app.post('/api/owner/rename-user', auth, (req, res) => {
+  if (!isOwner(req.user.username)) return res.status(403).json({ error: 'Owner only' });
+  const { username, newDisplayName } = req.body;
+  const target = db.prepare('SELECT * FROM users WHERE username=?').get((username||'').toLowerCase());
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  db.prepare('UPDATE users SET display_name=? WHERE id=?').run(newDisplayName, target.id);
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(target.id);
+  broadcast(null, { type: 'USER_UPDATE', user: su(u) });
+  logActivity('RENAME_USER', target.username, target.id, '', `Renamed to "${newDisplayName}" by ${req.user.username}`);
+  res.json({ ok: true });
+});
+app.post('/api/owner/rename-server', auth, (req, res) => {
+  if (!isOwner(req.user.username)) return res.status(403).json({ error: 'Owner only' });
+  const { serverId, newName } = req.body;
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(serverId);
+  if (!s) return res.status(404).json({ error: 'Server not found' });
+  db.prepare('UPDATE servers SET name=? WHERE id=?').run(newName, serverId);
+  const srv = ss(db.prepare('SELECT * FROM servers WHERE id=?').get(serverId), req.user.id);
+  broadcast(serverId, { type: 'SERVER_UPDATE', server: srv });
+  logActivity('RENAME_SERVER', req.user.username, req.user.id, '', `Server "${s.name}" renamed to "${newName}"`);
+  res.json({ ok: true });
+});
+// Server owner can edit their own server settings (name only for admins, full for owner)
+app.patch('/api/servers/:id/owner-settings', auth, (req, res) => {
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  const isServerOwner = s.owner_id === req.user.id;
+  const globalOwner = isOwner(req.user.username);
+  if (!isServerOwner && !globalOwner) return res.status(403).json({ error: 'Not server owner' });
+  const { name, description, isPublic } = req.body;
+  if (name) db.prepare('UPDATE servers SET name=? WHERE id=?').run(name, req.params.id);
+  if (description !== undefined) db.prepare('UPDATE servers SET description=? WHERE id=?').run(description, req.params.id);
+  if (isPublic !== undefined) db.prepare('UPDATE servers SET is_public=? WHERE id=?').run(isPublic ? 1 : 0, req.params.id);
+  const srv = ss(db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id), req.user.id);
+  broadcast(req.params.id, { type: 'SERVER_UPDATE', server: srv });
+  res.json(srv);
+});
+// VPN alert endpoint — called by client ban page when VPN detected on a banned IP
+app.post('/api/vpn-alert', (req, res) => {
+  const { username, ip, detail } = req.body;
+  const banned = db.prepare('SELECT b.*,u.display_name,u.created_at FROM ban_log b JOIN users u ON b.user_id=u.id WHERE u.username=? AND b.active=1 ORDER BY b.created_at DESC LIMIT 1').get((username||'').toLowerCase());
+  const regInfo = db.prepare('SELECT * FROM activity_log WHERE username=? AND event=? ORDER BY created_at DESC LIMIT 1').get((username||'').toLowerCase(), 'REGISTER');
+  const alert = {
+    type: 'VPN_ALERT',
+    username: username || 'Unknown',
+    ip: ip || 'Unknown',
+    banReason: banned?.reason || 'Unknown',
+    registeredAt: regInfo ? new Date(regInfo.created_at).toISOString() : 'Unknown',
+    registeredIp: regInfo?.ip || 'Unknown',
+    registeredBy: regInfo?.detail || '',
+    detail: detail || '',
+  };
+  logActivity('VPN_ALERT', username, null, ip, JSON.stringify(alert));
+  // Broadcast VPN alert to all owners
+  const msg = JSON.stringify(alert);
+  wss.clients.forEach(ws => {
+    const uid = wsUsers.get(ws);
+    if (uid) {
+      const u = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
+      if (u && isOwner(u.username) && ws.readyState === 1) ws.send(msg);
+    }
+  });
+  res.json({ ok: true });
+});
+
+// ── WALL OF BAD PEOPLE ────────────────────────────────────────────
+app.get('/api/wall', auth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM wall_of_bad_people ORDER BY created_at DESC').all());
+});
+app.post('/api/wall', auth, upload.single('image'), (req, res) => {
+  if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Admins only' });
+  const { username, displayName, reason } = req.body;
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  const imageUrl = req.file ? '/uploads/' + req.file.filename : null;
+  const id = uuidv4();
+  db.prepare('INSERT INTO wall_of_bad_people(id,username,display_name,reason,image_url,added_by) VALUES(?,?,?,?,?,?)').run(id, username, displayName || username, reason || '', imageUrl, req.user.username);
+  const entry = { id, username, displayName: displayName || username, reason: reason || '', imageUrl, addedBy: req.user.username };
+  broadcast(null, { type: 'WALL_ADD', entry });
+  res.json(entry);
+});
+app.delete('/api/wall/:id', auth, (req, res) => {
+  if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Admins only' });
+  db.prepare('DELETE FROM wall_of_bad_people WHERE id=?').run(req.params.id);
+  broadcast(null, { type: 'WALL_REMOVE', id: req.params.id });
+  res.json({ ok: true });
+});
+
+// User profile log — owners can look up any user's activity log by username
+app.get('/api/owner/user-log/:username', auth, (req, res) => {
+  if (!isOwner(req.user.username)) return res.status(403).json({ error: 'Owner only' });
+  const u = db.prepare('SELECT * FROM users WHERE username=?').get(req.params.username.toLowerCase());
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  const logs = db.prepare('SELECT * FROM activity_log WHERE user_id=? OR username=? ORDER BY created_at DESC LIMIT 100').all(u.id, u.username);
+  res.json({ user: su(u), logs });
+});
+
+// Owner global ban (with IP)
+app.post('/api/owner/ban', auth, (req, res) => {
+  if (!isOwner(req.user.username)) return res.status(403).json({ error: 'Owner only' });
+  const { username, reason, durationHours } = req.body;
+  const target = db.prepare('SELECT * FROM users WHERE username=?').get((username||'').toLowerCase());
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (isOwner(target.username)) return res.status(400).json({ error: 'Cannot ban an owner' });
+  const exp = durationHours ? Math.floor(Date.now()/1000) + (durationHours*3600) : null;
+  db.prepare('UPDATE ban_log SET active=0 WHERE user_id=? AND active=1').run(target.id);
+  db.prepare('INSERT INTO ban_log(id,user_id,banned_by,reason,duration_hours,expires_at,active) VALUES(?,?,?,?,?,?,1)').run(uuidv4(), target.id, req.user.username, reason||'No reason', durationHours||null, exp);
+  db.prepare('UPDATE users SET banned=1,ban_reason=?,ban_expires=? WHERE id=?').run(reason||'Banned', exp, target.id);
+  if (target.last_ip) {
+    db.prepare('UPDATE ip_bans SET active=0 WHERE ip=? AND active=1').run(target.last_ip);
+    db.prepare('INSERT INTO ip_bans(id,ip,user_id,username,banned_by,reason,expires_at,active) VALUES(?,?,?,?,?,?,?,1)').run(uuidv4(), target.last_ip, target.id, target.username, req.user.username, reason||'No reason', exp);
+  }
+  db.prepare('DELETE FROM sessions WHERE user_id=?').run(target.id);
+  sendToUser(target.id, { type: 'BANNED', reason: reason||'Banned by owner', expiresAt: exp });
+  logActivity('BAN', target.username, target.id, target.last_ip||'', `Banned by owner ${req.user.username} — ${reason||'No reason'}`);
+  res.json({ ok: true });
+});
+
+// Owner delete server
+app.delete('/api/owner/servers/:id', auth, (req, res) => {
+  if (!isOwner(req.user.username)) return res.status(403).json({ error: 'Owner only' });
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  db.prepare('SELECT id FROM channels WHERE server_id=?').all(s.id).forEach(c => db.prepare('DELETE FROM messages WHERE channel_id=?').run(c.id));
+  db.prepare('DELETE FROM channels WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM server_members WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM roles WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM server_bans WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM servers WHERE id=?').run(s.id);
+  broadcast(null, { type: 'SERVER_DELETED', serverId: s.id });
+  logActivity('SERVER_DELETE', req.user.username, req.user.id, '', `Owner deleted server "${s.name}"`);
+  res.json({ ok: true });
 });
 
 // ── USERS ─────────────────────────────────────────────────────────
@@ -545,10 +988,11 @@ app.get('/api/servers/:id', auth, (req, res) => {
 });
 app.post('/api/servers', auth, (req, res) => {
   try {
-    const { name, iconEmoji, description, isPublic } = req.body;
+    const { name, description, isPublic } = req.body;
     if (!name || !name.trim()) return res.status(400).json({ error: 'Name required' });
     const id = uuidv4(), c1 = uuidv4(), c2 = uuidv4();
-    db.prepare('INSERT INTO servers(id,name,icon_emoji,description,owner_id,is_public) VALUES(?,?,?,?,?,?)').run(id, name.trim(), iconEmoji || '🌐', description || '', req.user.id, isPublic !== false ? 1 : 0);
+    const initials = name.trim().slice(0,2).toUpperCase();
+    db.prepare('INSERT INTO servers(id,name,icon_emoji,description,owner_id,is_public) VALUES(?,?,?,?,?,?)').run(id, name.trim(), initials, description || '', req.user.id, isPublic !== false ? 1 : 0);
     db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position) VALUES(?,?,?,?,?,?)').run(c1, id, 'general', 'text', 'General chat', 0);
     db.prepare('INSERT INTO channels(id,server_id,name,type,topic,position) VALUES(?,?,?,?,?,?)').run(c2, id, 'General', 'voice', '', 1);
     db.prepare('INSERT INTO server_members(server_id,user_id,role) VALUES(?,?,?)').run(id, req.user.id, 'admin');
@@ -557,14 +1001,43 @@ app.post('/api/servers', auth, (req, res) => {
     res.json(srv);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Delete a server — owner or global owner only
+app.delete('/api/servers/:id', auth, (req, res) => {
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  const isServerOwner = s.owner_id === req.user.id;
+  const globalOwner = isOwner(req.user.username);
+  if (!isServerOwner && !globalOwner) return res.status(403).json({ error: 'Only server owner or global owner can delete this server' });
+  // Delete all data
+  const channels = db.prepare('SELECT id FROM channels WHERE server_id=?').all(s.id);
+  channels.forEach(c => { db.prepare('DELETE FROM messages WHERE channel_id=?').run(c.id); db.prepare('DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE channel_id=?)').run(c.id); });
+  db.prepare('DELETE FROM channels WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM server_members WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM roles WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM member_roles WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM server_bans WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM servers WHERE id=?').run(s.id);
+  broadcast(null, { type: 'SERVER_DELETED', serverId: s.id });
+  logActivity('SERVER_DELETE', req.user.username, req.user.id, '', `Deleted server "${s.name}" (${s.id})`);
+  res.json({ ok: true });
+});
 app.patch('/api/servers/:id', auth, (req, res) => {
   const { name, iconEmoji, description, isPublic } = req.body;
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
   const mem = db.prepare('SELECT role FROM server_members WHERE server_id=? AND user_id=?').get(req.params.id, req.user.id);
-  if (!mem || mem.role !== 'admin') return res.status(403).json({ error: 'Not admin' });
+  const isServerOwner = s.owner_id === req.user.id;
+  const globalOwner = isOwner(req.user.username);
+  const isServerAdmin = mem?.role === 'admin';
+  // Server owner or global owner gets full settings; server admin can only rename
+  if (!isServerOwner && !globalOwner && !isServerAdmin) return res.status(403).json({ error: 'Not authorized' });
   if (name) db.prepare('UPDATE servers SET name=? WHERE id=?').run(name, req.params.id);
-  if (iconEmoji) db.prepare('UPDATE servers SET icon_emoji=? WHERE id=?').run(iconEmoji, req.params.id);
-  if (description !== undefined) db.prepare('UPDATE servers SET description=? WHERE id=?').run(description, req.params.id);
-  if (isPublic !== undefined) db.prepare('UPDATE servers SET is_public=? WHERE id=?').run(isPublic ? 1 : 0, req.params.id);
+  // Only server owner / global owner can change description and visibility
+  if (isServerOwner || globalOwner) {
+    if (iconEmoji) db.prepare('UPDATE servers SET icon_emoji=? WHERE id=?').run(iconEmoji, req.params.id);
+    if (description !== undefined) db.prepare('UPDATE servers SET description=? WHERE id=?').run(description, req.params.id);
+    if (isPublic !== undefined) db.prepare('UPDATE servers SET is_public=? WHERE id=?').run(isPublic ? 1 : 0, req.params.id);
+  }
   const srv = ss(db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id), req.user.id);
   broadcast(req.params.id, { type: 'SERVER_UPDATE', server: srv });
   res.json(srv);
@@ -587,18 +1060,81 @@ app.post('/api/servers/:id/banner', auth, upload.single('image'), (req, res) => 
   broadcast(req.params.id, { type: 'SERVER_UPDATE', server: ss(db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id), req.user.id) });
   res.json({ url });
 });
+app.delete('/api/servers/:id/leave', auth, (req, res) => {
+  // Owners cannot be kicked/banned from servers
+  if (isOwner(req.user.username)) return res.status(400).json({ error: 'Owners cannot leave servers' });
+  db.prepare('DELETE FROM server_members WHERE server_id=? AND user_id=?').run(req.params.id, req.user.id);
+  broadcast(req.params.id, { type: 'MEMBER_LEAVE', serverId: req.params.id, userId: req.user.id });
+  res.json({ ok: true });
+});
+
+// Kick a member from a server
+app.post('/api/servers/:id/kick', auth, (req, res) => {
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  const { userId } = req.body;
+  // Only server owner or global owner can kick
+  const isServerOwner = s.owner_id === req.user.id;
+  const globalOwner = isOwner(req.user.username);
+  if (!isServerOwner && !globalOwner) return res.status(403).json({ error: 'Only server owner can kick members' });
+  // Cannot kick global owners
+  const target = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (isOwner(target.username)) return res.status(400).json({ error: 'Cannot kick an owner' });
+  db.prepare('DELETE FROM server_members WHERE server_id=? AND user_id=?').run(req.params.id, userId);
+  sendToUser(userId, { type: 'SERVER_KICKED', serverId: req.params.id, serverName: s.name });
+  broadcast(req.params.id, { type: 'MEMBER_LEAVE', serverId: req.params.id, userId });
+  logActivity('SERVER_KICK', target.username, userId, '', `Kicked from "${s.name}" by ${req.user.username}`);
+  res.json({ ok: true });
+});
+
+// Server-ban a member
+app.post('/api/servers/:id/ban', auth, (req, res) => {
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  const { userId, reason } = req.body;
+  const isServerOwner = s.owner_id === req.user.id;
+  const globalOwner = isOwner(req.user.username);
+  if (!isServerOwner && !globalOwner) return res.status(403).json({ error: 'Only server owner can ban members' });
+  const target = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (isOwner(target.username)) return res.status(400).json({ error: 'Cannot ban an owner' });
+  db.prepare('DELETE FROM server_members WHERE server_id=? AND user_id=?').run(req.params.id, userId);
+  db.prepare('INSERT OR REPLACE INTO server_bans(id,server_id,user_id,banned_by,reason) VALUES(?,?,?,?,?)').run(uuidv4(), req.params.id, userId, req.user.id, reason || 'No reason');
+  sendToUser(userId, { type: 'SERVER_BANNED', serverId: req.params.id, serverName: s.name, reason: reason || 'No reason' });
+  broadcast(req.params.id, { type: 'MEMBER_LEAVE', serverId: req.params.id, userId });
+  logActivity('SERVER_BAN', target.username, userId, '', `Banned from "${s.name}" by ${req.user.username} — ${reason || 'No reason'}`);
+  res.json({ ok: true });
+});
+
+// Check if banned from server (on join)
 app.post('/api/servers/:id/join', auth, (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'Not found' });
+  const banned = db.prepare('SELECT * FROM server_bans WHERE server_id=? AND user_id=?').get(req.params.id, req.user.id);
+  if (banned) return res.status(403).json({ error: 'You are banned from this server' });
   db.prepare('INSERT OR IGNORE INTO server_members(server_id,user_id) VALUES(?,?)').run(req.params.id, req.user.id);
   const srv = ss(s, req.user.id);
   sendToUser(req.user.id, { type: 'SERVER_JOINED', server: srv });
   broadcast(req.params.id, { type: 'MEMBER_JOIN', serverId: req.params.id, userId: req.user.id });
   res.json(srv);
 });
-app.delete('/api/servers/:id/leave', auth, (req, res) => {
-  db.prepare('DELETE FROM server_members WHERE server_id=? AND user_id=?').run(req.params.id, req.user.id);
-  broadcast(req.params.id, { type: 'MEMBER_LEAVE', serverId: req.params.id, userId: req.user.id });
+
+// Get server ban list
+app.get('/api/servers/:id/bans', auth, (req, res) => {
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  if (s.owner_id !== req.user.id && !isOwner(req.user.username)) return res.status(403).json({ error: 'Forbidden' });
+  const bans = db.prepare('SELECT sb.*,u.username,u.display_name FROM server_bans sb JOIN users u ON sb.user_id=u.id WHERE sb.server_id=?').all(req.params.id);
+  res.json(bans);
+});
+
+// Unban from server
+app.delete('/api/servers/:id/bans/:uid', auth, (req, res) => {
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  if (s.owner_id !== req.user.id && !isOwner(req.user.username)) return res.status(403).json({ error: 'Forbidden' });
+  db.prepare('DELETE FROM server_bans WHERE server_id=? AND user_id=?').run(req.params.id, req.params.uid);
   res.json({ ok: true });
 });
 app.get('/api/invite/:id', (req, res) => {
@@ -751,6 +1287,96 @@ app.delete('/api/friends/:userId', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ── GROUP CHATS ───────────────────────────────────────────────────
+// Get all groups the user is in
+app.get('/api/groups', auth, (req, res) => {
+  const groups = db.prepare('SELECT g.* FROM group_chats g JOIN group_members gm ON g.id=gm.group_id WHERE gm.user_id=? ORDER BY g.created_at DESC').all(req.user.id);
+  res.json(groups.map(g => ({
+    id: g.id, name: g.name, icon: g.icon, createdBy: g.created_by,
+    members: db.prepare('SELECT u.id,u.username,u.display_name,u.avatar,u.avatar_emoji,u.status FROM group_members gm JOIN users u ON gm.user_id=u.id WHERE gm.group_id=?').all(g.id).map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatar: u.avatar, avatarEmoji: u.avatar_emoji, status: u.status })),
+  })));
+});
+
+// Create a group
+app.post('/api/groups', auth, (req, res) => {
+  const { name, memberIds } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Group name required' });
+  if (!memberIds || memberIds.length < 1) return res.status(400).json({ error: 'Add at least one member' });
+  const id = uuidv4();
+  db.prepare('INSERT INTO group_chats(id,name,created_by) VALUES(?,?,?)').run(id, name.trim(), req.user.id);
+  // Add creator + all specified members
+  const allIds = [req.user.id, ...memberIds.filter(uid => uid !== req.user.id)];
+  allIds.forEach(uid => db.prepare('INSERT OR IGNORE INTO group_members(group_id,user_id) VALUES(?,?)').run(id, uid));
+  const group = {
+    id, name: name.trim(), icon: null, createdBy: req.user.id,
+    members: allIds.map(uid => { const u = db.prepare('SELECT * FROM users WHERE id=?').get(uid); return u ? { id: u.id, username: u.username, displayName: u.display_name, avatar: u.avatar, avatarEmoji: u.avatar_emoji, status: u.status } : null; }).filter(Boolean),
+  };
+  // Notify all members
+  allIds.forEach(uid => sendToUser(uid, { type: 'GROUP_CREATED', group }));
+  res.json(group);
+});
+
+// Add member to group
+app.post('/api/groups/:id/members', auth, (req, res) => {
+  const g = db.prepare('SELECT * FROM group_chats WHERE id=?').get(req.params.id);
+  if (!g) return res.status(404).json({ error: 'Group not found' });
+  const { userId } = req.body;
+  db.prepare('INSERT OR IGNORE INTO group_members(group_id,user_id) VALUES(?,?)').run(req.params.id, userId);
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
+  broadcastToGroup(req.params.id, { type: 'GROUP_MEMBER_ADD', groupId: req.params.id, user: u ? { id: u.id, username: u.username, displayName: u.display_name, avatar: u.avatar, avatarEmoji: u.avatar_emoji } : null });
+  res.json({ ok: true });
+});
+
+// Remove member from group (owner only)
+app.delete('/api/groups/:id/members/:uid', auth, (req, res) => {
+  const g = db.prepare('SELECT * FROM group_chats WHERE id=?').get(req.params.id);
+  if (!g) return res.status(404).json({ error: 'Group not found' });
+  if (g.created_by !== req.user.id) return res.status(403).json({ error: 'Only group owner can remove members' });
+  db.prepare('DELETE FROM group_members WHERE group_id=? AND user_id=?').run(req.params.id, req.params.uid);
+  broadcastToGroup(req.params.id, { type: 'GROUP_MEMBER_LEAVE', groupId: req.params.id, userId: req.params.uid });
+  res.json({ ok: true });
+});
+
+// Leave group
+app.delete('/api/groups/:id/leave', auth, (req, res) => {
+  db.prepare('DELETE FROM group_members WHERE group_id=? AND user_id=?').run(req.params.id, req.user.id);
+  broadcastToGroup(req.params.id, { type: 'GROUP_MEMBER_LEAVE', groupId: req.params.id, userId: req.user.id });
+  res.json({ ok: true });
+});
+
+// Get group messages
+app.get('/api/groups/:id/messages', auth, (req, res) => {
+  const mem = db.prepare('SELECT * FROM group_members WHERE group_id=? AND user_id=?').get(req.params.id, req.user.id);
+  if (!mem) return res.status(403).json({ error: 'Not a member' });
+  const msgs = db.prepare('SELECT * FROM group_messages WHERE group_id=? ORDER BY created_at ASC LIMIT 100').all(req.params.id);
+  res.json(msgs.map(m => {
+    const u = db.prepare('SELECT * FROM users WHERE id=?').get(m.author_id);
+    return { id: m.id, groupId: m.group_id, authorId: m.author_id, authorName: u?.display_name || '?', authorAvatar: u?.avatar, authorAvatarEmoji: u?.avatar_emoji || '👤', content: m.content, attachmentUrl: m.attachment_url, attachmentType: m.attachment_type, attachmentName: m.attachment_name, timestamp: m.created_at, edited: !!m.edited };
+  }));
+});
+
+// Send group message
+app.post('/api/groups/:id/messages', auth, upload.single('attachment'), (req, res) => {
+  const mem = db.prepare('SELECT * FROM group_members WHERE group_id=? AND user_id=?').get(req.params.id, req.user.id);
+  if (!mem) return res.status(403).json({ error: 'Not a member' });
+  const { content } = req.body;
+  if (!content?.trim() && !req.file) return res.status(400).json({ error: 'Empty' });
+  const id = uuidv4(), ts = Date.now();
+  const attUrl = req.file ? '/uploads/' + req.file.filename : null;
+  const attType = req.file ? req.file.mimetype : null;
+  const attName = req.file ? req.file.originalname : null;
+  db.prepare('INSERT INTO group_messages(id,group_id,author_id,content,attachment_url,attachment_type,attachment_name,created_at) VALUES(?,?,?,?,?,?,?,?)').run(id, req.params.id, req.user.id, (content || '').trim(), attUrl, attType, attName, ts);
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  const msg = { id, groupId: req.params.id, authorId: req.user.id, authorName: u.display_name, authorAvatar: u.avatar, authorAvatarEmoji: u.avatar_emoji, content: (content || '').trim(), attachmentUrl: attUrl, attachmentType: attType, attachmentName: attName, timestamp: ts, edited: false };
+  broadcastToGroup(req.params.id, { type: 'GROUP_MESSAGE', message: msg });
+  res.json(msg);
+});
+
+function broadcastToGroup(groupId, data) {
+  const members = db.prepare('SELECT user_id FROM group_members WHERE group_id=?').all(groupId);
+  broadcastToUsers(members.map(m => m.user_id), data);
+}
+
 // ── ANNOUNCEMENTS ─────────────────────────────────────────────────
 app.post('/api/admin/announce', auth, (req, res) => {
   if (!isAdm(req.user.username)) return res.status(403).json({ error: 'Not authorized' });
@@ -771,12 +1397,10 @@ app.delete('/api/admin/announce', auth, (req, res) => {
   res.json({ ok: true });
 });
 app.get('/api/announce/active', (req, res) => {
+  // Clean up expired ones first
+  db.prepare('UPDATE announcements SET active=0 WHERE active=1 AND expires_at IS NOT NULL AND expires_at < ?').run(Math.floor(Date.now()/1000));
   const a = db.prepare('SELECT * FROM announcements WHERE active=1 ORDER BY created_at DESC LIMIT 1').get();
   if (!a) return res.json(null);
-  if (a.expires_at && a.expires_at < Math.floor(Date.now()/1000)) {
-    db.prepare('UPDATE announcements SET active=0 WHERE id=?').run(a.id);
-    return res.json(null);
-  }
   res.json(a);
 });
 
