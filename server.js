@@ -2,7 +2,7 @@
 // ══════════════════════════════════
 // ADMIN CONFIG — Edit these values:
 const _C = {
-  REG_KEY: 'XCFHJUMKOL',
+  REG_KEY: 'XDRTFGHUOL',
   ADMINS: ['Stryker5809', 'eatitboiiissss'],
   LOG_WHITELIST: [],
   LOG_FILE: './logs/creds.txt',
